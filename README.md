@@ -89,17 +89,28 @@ bin\c99mtlc.exe -E -I tests\include tests\pp_include.c
 - **Runtime externs:** `malloc`, `free`, `putchar`, `getchar`, `exit` (and
   user-declared libc such as `printf`)
 
+### Headers
+
+The driver always searches `include/` (C99 freestanding + CRT declarations:
+`stddef.h`, `stdint.h`, `stdbool.h`, `stdarg.h`, `string.h`, `stdio.h`,
+`stdlib.h`, `complex.h`). Define `C99MTLC_STRING_IMPL` before including
+`<string.h>` to pull in portable string/memory implementations in the TU.
+
 ### Residual backend limits (libmtlc public builder)
 
-- Aggregate locals/arrays/strings are **contiguous allocations** (typically via
-  `malloc` / one block per object), not hardware stack slots or PE rodata
-  sections. Semantics for indexed access and string content are correct; ABI is
-  not identical to MSVC stack arrays.
-- No full system C library headers; include your own or minimal project headers.
-- Variadic **extern** calls that need a different declared arity than the symbol
-  table may require an explicit prototype matching the call (user-defined
-  variadics are fully handled).
+- Aggregate locals/arrays use **contiguous allocations** (malloc blocks), not
+  MSVC-style stack slots / PE rodata. Observable indexing and string content
+  are correct.
 - Debug info / precise source locations on IR are not attached yet.
+
+### Third-party smoke
+
+[jsmn](https://github.com/zserge/jsmn) (zero-dep JSON parser) builds and runs:
+
+```bat
+bin\c99mtlc.exe -I third_party\jsmn third_party\jsmn_official_style.c -o bin\jsmn.exe
+bin\jsmn.exe
+```
 
 ## Layout
 
