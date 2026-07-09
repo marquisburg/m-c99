@@ -4,10 +4,32 @@ A **C99 compiler frontend** that lowers to [libmtlc](libmtlc/), a standalone
 native backend (custom IR, classical + ML optimizers, x86-64 / ARM64 / PTX /
 SPIR-V codegen, PE linker on Windows).
 
+```mermaid
+flowchart LR
+  src[".c source"] --> lex[lex]
+  lex --> parse[parse]
+  parse --> sema[sema]
+  sema --> lower["lower<br/>mtlc/build.h"]
+  lower --> ir[MtlcModule]
+  ir --> opt[optimize]
+  opt --> cg[codegen / link]
+  cg --> out[".exe / .obj"]
 ```
-  .c source  →  lex  →  parse  →  sema  →  lower (mtlc/build.h)  →  libmtlc pipeline
-                                                                      ↓
-                                                              native .exe / .obj
+
+```mermaid
+flowchart TB
+  subgraph fe [Frontend]
+    lex2[Lexer] --> parse2[Parser]
+    parse2 --> sema2[Sema]
+    sema2 --> lower2[Lower]
+  end
+  subgraph be [libmtlc]
+    ir2[IR module] --> opt2[Classical opt]
+    opt2 --> ml[ML-opt optional]
+    ml --> x86[x86-64 object]
+    x86 --> pe[PE / ELF link]
+  end
+  lower2 --> ir2
 ```
 
 ## Build
@@ -70,14 +92,24 @@ has no aggregate stack locals). String literals are pooled and filled through
 
 ## Layout
 
-```
-src/           frontend (lex, parse, types, sema, lower, driver)
-libmtlc/       backend headers, docs, static library
-tests/         sample C programs
-bin/           build output
+```mermaid
+flowchart LR
+  srcdir[src/] --- fe["lex, parse, types,<br/>sema, lower, driver"]
+  lib[libmtlc/] --- be["headers, mtlc.lib"]
+  tests[tests/] --- samples["sample .c programs"]
+  bin[bin/] --- out2["build output"]
 ```
 
 ## Pipeline ownership
+
+```mermaid
+flowchart TB
+  lex3[Lexer] -->|tokens, escapes, locations| parse3[Parser]
+  parse3 -->|AST, declarations| sema3[Sema]
+  sema3 -->|typed scopes, conversions| lower3[Lower]
+  lower3 -->|explicit CF, mtlc types| mtlc[libmtlc]
+  mtlc -->|opt, object, link| bin3[native binary]
+```
 
 | Phase | Owns |
 |-------|------|
