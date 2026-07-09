@@ -96,12 +96,16 @@ The driver always searches `include/` (C99 freestanding + CRT declarations:
 `stdlib.h`, `complex.h`). Define `C99MTLC_STRING_IMPL` before including
 `<string.h>` to pull in portable string/memory implementations in the TU.
 
-### Residual backend limits (libmtlc public builder)
+### Storage model (libmtlc public builder)
 
-- Aggregate locals/arrays use **contiguous allocations** (malloc blocks), not
-  MSVC-style stack slots / PE rodata. Observable indexing and string content
-  are correct.
-- Debug info / precise source locations on IR are not attached yet.
+| Object | Strategy |
+|--------|----------|
+| Fixed local arrays / structs / unions / `_Complex` / compound literals | Stack: custom-size `MtlcType` + `mtlc_local` + `address_of` |
+| VLAs | Heap (`malloc`) — size not known at compile time |
+| String literals | Payload in packed `u64` data globals; one permanent heap buffer on first use (`address_of` on globals is not a reliable `char*` in the public API) |
+| File-scope aggregates / address-taken globals | Pointer global + lazy heap (stack would not outlive the function) |
+
+Debug info / IR source locations are not attached yet.
 
 ### Third-party smoke
 
