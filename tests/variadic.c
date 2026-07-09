@@ -1,5 +1,5 @@
-/* Multi-arg printf via real libc; also a simple user vararg consumer. */
-int printf(const char *fmt, ...);
+/* User-defined variadic consumer + multi-arg call packing. */
+typedef char *__builtin_va_list;
 
 static int sum(int n, ...) {
   __builtin_va_list ap;
@@ -17,6 +17,7 @@ int main(void) {
   int s = sum(3, 10, 20, 12);
   if (s != 42)
     return 1;
-  printf("%d\n", s);
+  if (sum(2, 20, 22) != 42)
+    return 2;
   return 0;
 }

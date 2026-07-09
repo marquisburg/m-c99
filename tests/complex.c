@@ -7,7 +7,8 @@ int main(void) {
   if (mag2 < 24.5 || mag2 > 25.5)
     return 1;
   _Complex double w = z + z;
-  if (__real__(w) < 5.5 || __real__(w) > 6.5)
+  double wr = __real__(w);
+  if (wr < 5.5 || wr > 6.5)
     return 2;
   return 0;
 }

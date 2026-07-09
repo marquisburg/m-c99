@@ -8,6 +8,42 @@ static Type *mk_prim(TypeContext *tc, TypeKind k, size_t size, size_t align) {
   return t;
 }
 
+Type *type_tag_lookup(TypeContext *tc, const char *tag, int is_union) {
+  if (!tag)
+    return NULL;
+  for (size_t i = 0; i < tc->ntags; i++) {
+    Type *t = tc->tags[i];
+    if (!t || !t->tag || strcmp(t->tag, tag) != 0)
+      continue;
+    if (is_union && t->kind != TY_UNION)
+      continue;
+    if (!is_union && t->kind != TY_STRUCT && t->kind != TY_ENUM)
+      continue;
+    return t;
+  }
+  return NULL;
+}
+
+void type_tag_register(TypeContext *tc, Type *t) {
+  if (!t || !t->tag)
+    return;
+  for (size_t i = 0; i < tc->ntags; i++) {
+    if (tc->tags[i] && tc->tags[i]->tag &&
+        strcmp(tc->tags[i]->tag, t->tag) == 0 &&
+        tc->tags[i]->kind == t->kind) {
+      tc->tags[i] = t;
+      return;
+    }
+  }
+  size_t n = tc->ntags + 1;
+  Type **arr = (Type **)arena_alloc(tc->arena, n * sizeof(Type *));
+  if (tc->ntags)
+    memcpy(arr, tc->tags, tc->ntags * sizeof(Type *));
+  arr[tc->ntags] = t;
+  tc->tags = arr;
+  tc->ntags = n;
+}
+
 void type_context_init(TypeContext *tc, Arena *arena) {
   memset(tc, 0, sizeof(*tc));
   tc->arena = arena;
@@ -85,10 +121,31 @@ void type_struct_add_member(TypeContext *tc, Type *st, const char *name,
                             Type *mty) {
   (void)tc;
   StructMember m;
+  memset(&m, 0, sizeof(m));
   m.name = name;
   m.type = mty;
   m.offset = 0;
   buf_push(st->members, m);
+}
+
+void type_struct_add_bitfield(TypeContext *tc, Type *st, const char *name,
+                              Type *mty, int width) {
+  StructMember m;
+  memset(&m, 0, sizeof(m));
+  m.name = name;
+  m.type = mty ? mty : tc->ty_uint;
+  m.is_bitfield = 1;
+  m.bit_width = width;
+  buf_push(st->members, m);
+}
+
+Type *type_complex(TypeContext *tc, Type *real_ty) {
+  Type *t = (Type *)arena_calloc(tc->arena, sizeof(Type));
+  t->kind = TY_COMPLEX;
+  t->base = real_ty ? real_ty : tc->ty_double;
+  t->size = t->base->size * 2;
+  t->align = t->base->align;
+  return t;
 }
 
 static size_t align_up(size_t x, size_t a) {
@@ -99,27 +156,80 @@ void type_struct_finish(Type *st) {
   size_t off = 0;
   size_t max_align = 1;
   size_t max_size = 0;
+  /* bitfield packing into unsigned int units (4 bytes) on LLP64 */
+  size_t bf_unit_off = 0;
+  int bf_bit = 0;
+  int in_bf = 0;
+
   for (size_t i = 0; i < buf_len(st->members); i++) {
-    Type *mt = st->members[i].type;
-    if (!mt || !type_is_complete(mt))
+    StructMember *sm = &st->members[i];
+    Type *mt = sm->type;
+    if (!mt)
+      continue;
+
+    if (sm->is_bitfield) {
+      int w = sm->bit_width;
+      if (w == 0) {
+        /* zero-width: force new unit */
+        if (in_bf && bf_bit > 0) {
+          off = bf_unit_off + 4;
+          in_bf = 0;
+          bf_bit = 0;
+        }
+        continue;
+      }
+      if (st->is_union) {
+        sm->offset = 0;
+        sm->bit_offset = 0;
+        if (4 > max_size)
+          max_size = 4;
+        if (4 > max_align)
+          max_align = 4;
+        continue;
+      }
+      if (!in_bf || bf_bit + w > 32) {
+        if (in_bf)
+          off = bf_unit_off + 4;
+        off = align_up(off, 4);
+        bf_unit_off = off;
+        bf_bit = 0;
+        in_bf = 1;
+        if (4 > max_align)
+          max_align = 4;
+      }
+      sm->offset = bf_unit_off;
+      sm->bit_offset = bf_bit;
+      bf_bit += w;
+      continue;
+    }
+
+    if (in_bf) {
+      off = bf_unit_off + 4;
+      in_bf = 0;
+      bf_bit = 0;
+    }
+    if (!type_is_complete(mt))
       continue;
     if (mt->align > max_align)
       max_align = mt->align;
     if (st->is_union) {
-      st->members[i].offset = 0;
+      sm->offset = 0;
       if (mt->size > max_size)
         max_size = mt->size;
     } else {
       off = align_up(off, mt->align);
-      st->members[i].offset = off;
+      sm->offset = off;
       off += mt->size;
     }
   }
-  st->align = max_align;
+  if (in_bf)
+    off = bf_unit_off + 4;
+
+  st->align = max_align ? max_align : 1;
   if (st->is_union)
-    st->size = align_up(max_size, max_align);
+    st->size = align_up(max_size, st->align);
   else
-    st->size = align_up(off, max_align);
+    st->size = align_up(off, st->align);
   st->is_incomplete = 0;
 }
 
@@ -377,6 +487,9 @@ const char *type_to_string(TypeContext *tc, const Type *t) {
     return t->tag ? arena_sprintf(tc->arena, "union %s", t->tag) : "union";
   case TY_ENUM:
     return t->tag ? arena_sprintf(tc->arena, "enum %s", t->tag) : "enum";
+  case TY_COMPLEX:
+    return arena_sprintf(tc->arena, "_Complex %s",
+                         type_to_string(tc, t->base));
   }
   return "<type>";
 }

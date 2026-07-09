@@ -226,6 +226,12 @@ static Type *check_expr(Sema *S, Node *e) {
     e->type = type_ptr(S->tc, S->tc->ty_char);
     return e->type;
   case EX_IDENT: {
+    if (e->name && strcmp(e->name, "__c99m_I") == 0) {
+      e->type = type_complex(S->tc, S->tc->ty_double);
+      e->kind = EX_BUILTIN;
+      e->name = "__c99m_I";
+      return e->type;
+    }
     Symbol *sym = sema_lookup(S, e->name);
     if (!sym) {
       diag_error(S->diag, e->loc, "undeclared identifier '%s'", e->name);
@@ -239,11 +245,42 @@ static Type *check_expr(Sema *S, Node *e) {
       e->type = S->tc->ty_int;
       return e->type;
     }
+    if (sym->kind == SYM_FUNC) {
+      e->type = type_ptr(S->tc, sym->type);
+      return e->type;
+    }
     e->type = sym->type;
     return e->type;
   }
-  case EX_BINARY:
-    return check_binary(S, e);
+  case EX_BINARY: {
+    Type *lt0 = e->lhs ? e->lhs->type : NULL;
+    Type *rt0 = e->rhs ? e->rhs->type : NULL;
+    (void)lt0;
+    (void)rt0;
+    Type *r = check_binary(S, e);
+    /* complex arithmetic: promote if either side complex */
+    Type *lt = e->lhs->type, *rt = e->rhs->type;
+    if ((lt && lt->kind == TY_COMPLEX) || (rt && rt->kind == TY_COMPLEX)) {
+      Type *elem = S->tc->ty_double;
+      if (lt && lt->kind == TY_COMPLEX && lt->base)
+        elem = lt->base;
+      if (rt && rt->kind == TY_COMPLEX && rt->base)
+        elem = rt->base;
+      if (e->op == OP_EQ || e->op == OP_NE)
+        e->type = S->tc->ty_int;
+      else
+        e->type = type_complex(S->tc, elem);
+      return e->type;
+    }
+    return r;
+  }
+  case EX_BUILTIN:
+    if (e->name && strcmp(e->name, "__c99m_I") == 0) {
+      e->type = type_complex(S->tc, S->tc->ty_double);
+      return e->type;
+    }
+    e->type = e->type ? e->type : S->tc->ty_int;
+    return e->type;
   case EX_UNARY: {
     Type *t = type_decay(S->tc, check_expr(S, e->lhs));
     switch (e->op) {
@@ -292,10 +329,41 @@ static Type *check_expr(Sema *S, Node *e) {
     return e->type;
   }
   case EX_CALL: {
+    /* builtins */
+    if (e->lhs->kind == EX_IDENT && e->lhs->name) {
+      const char *bn = e->lhs->name;
+      if (strcmp(bn, "__builtin_va_start") == 0 ||
+          strcmp(bn, "__builtin_va_end") == 0) {
+        for (size_t i = 0; i < buf_len(e->stmts); i++)
+          check_expr(S, e->stmts[i]);
+        e->type = S->tc->ty_void;
+        e->kind = EX_BUILTIN;
+        e->name = bn;
+        return e->type;
+      }
+      if (strcmp(bn, "__builtin_va_arg") == 0) {
+        if (buf_len(e->stmts) >= 1)
+          check_expr(S, e->stmts[0]);
+        e->decl_type = resolve_type(S, e->decl_type);
+        e->type = e->decl_type ? e->decl_type : S->tc->ty_int;
+        e->kind = EX_BUILTIN;
+        e->name = bn;
+        return e->type;
+      }
+      if (strcmp(bn, "__real__") == 0 || strcmp(bn, "__imag__") == 0) {
+        Type *t = check_expr(S, e->stmts[0]);
+        e->type = (t && t->kind == TY_COMPLEX) ? t->base : S->tc->ty_double;
+        e->kind = EX_BUILTIN;
+        e->name = bn;
+        return e->type;
+      }
+    }
     Type *ft = type_decay(S->tc, check_expr(S, e->lhs));
     Type *fnty = ft;
     if (ft->kind == TY_PTR && ft->base && ft->base->kind == TY_FUNC)
       fnty = ft->base;
+    if (ft->kind == TY_FUNC)
+      fnty = ft;
     if (fnty->kind != TY_FUNC) {
       diag_error(S->diag, e->loc, "called object is not a function");
       e->type = S->tc->ty_int;
@@ -337,7 +405,14 @@ static Type *check_expr(Sema *S, Node *e) {
       }
       t = t->base;
     }
-    if (t->kind != TY_STRUCT && t->kind != TY_UNION) {
+    /* Resolve tag if incomplete placeholder */
+    if (t && t->tag && (t->kind == TY_STRUCT || t->kind == TY_UNION) &&
+        t->is_incomplete) {
+      Type *full = type_tag_lookup(S->tc, t->tag, t->kind == TY_UNION);
+      if (full)
+        t = full;
+    }
+    if (!t || (t->kind != TY_STRUCT && t->kind != TY_UNION)) {
       diag_error(S->diag, e->loc, "member reference on non-struct");
       e->type = S->tc->ty_int;
       return e->type;
@@ -388,8 +463,15 @@ static Type *check_expr(Sema *S, Node *e) {
     return e->type;
   }
   case EX_INIT_LIST:
-  case EX_COMPOUND_LITERAL:
+    for (size_t i = 0; i < buf_len(e->stmts); i++)
+      check_expr(S, e->stmts[i]);
     e->type = e->decl_type ? resolve_type(S, e->decl_type) : S->tc->ty_int;
+    return e->type;
+  case EX_COMPOUND_LITERAL:
+    e->decl_type = resolve_type(S, e->decl_type);
+    e->type = e->decl_type;
+    if (e->init)
+      check_expr(S, e->init);
     return e->type;
   default:
     e->type = S->tc->ty_int;

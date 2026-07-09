@@ -57,6 +57,9 @@ static Type *parse_declaration_specifiers(Parser *P, StorageClass *sc,
                                           int *saw_type);
 static Type *parse_declarator(Parser *P, Type *base, char **out_name,
                               Node ***out_params, int *out_variadic);
+static Type *parse_declarator_x(Parser *P, Type *base, char **out_name,
+                                Node ***out_params, int *out_variadic,
+                                Node **out_vla_size);
 static Node *parse_initializer(Parser *P);
 static int is_type_token(Parser *P);
 
@@ -132,6 +135,18 @@ static Node *parse_postfix(Parser *P) {
     if (match(P, TK_LPAREN)) {
       Node *call = node_new(P->arena, EX_CALL, loc);
       call->lhs = e;
+      /* __builtin_va_arg(ap, type) */
+      if (e->kind == EX_IDENT && e->name &&
+          strcmp(e->name, "__builtin_va_arg") == 0) {
+        Node *ap = parse_assign(P);
+        buf_push(call->stmts, ap);
+        expect(P, TK_COMMA);
+        Type *ty = parse_type_name(P);
+        call->decl_type = ty;
+        expect(P, TK_RPAREN);
+        e = call;
+        continue;
+      }
       if (!check(P, TK_RPAREN)) {
         do {
           Node *arg = parse_assign(P);
@@ -361,6 +376,7 @@ static int is_type_token(Parser *P) {
   case TK_CONST:
   case TK_VOLATILE:
   case TK_RESTRICT:
+  case TK_COMPLEX:
     return 1;
   case TK_IDENT:
     return lexer_is_typedef(P->lexer, P->tok.text);
@@ -376,8 +392,18 @@ static Type *parse_struct_or_union(Parser *P, int is_union) {
     tag = P->tok.text;
     next(P);
   }
-  Type *st = type_struct_create(P->tc, tag, is_union);
+  Type *st = NULL;
+  if (tag)
+    st = type_tag_lookup(P->tc, tag, is_union);
+  if (!st) {
+    st = type_struct_create(P->tc, tag, is_union);
+    if (tag)
+      type_tag_register(P->tc, st);
+  }
   if (match(P, TK_LBRACE)) {
+    /* clear prior members if redefining */
+    st->members = NULL;
+    st->is_incomplete = 1;
     while (!check(P, TK_RBRACE) && !check(P, TK_EOF)) {
       StorageClass sc = SC_NONE;
       int saw = 0;
@@ -389,7 +415,16 @@ static Type *parse_struct_or_union(Parser *P, int is_union) {
       do {
         char *name = NULL;
         Type *ty = parse_declarator(P, base, &name, NULL, NULL);
-        if (!name) {
+        if (match(P, TK_COLON)) {
+          long long w = 0;
+          if (check(P, TK_INT)) {
+            w = P->tok.ival;
+            next(P);
+          } else {
+            diag_error(P->diag, P->tok.loc, "expected bit-field width");
+          }
+          type_struct_add_bitfield(P->tc, st, name, ty, (int)w);
+        } else if (!name) {
           diag_error(P->diag, P->tok.loc, "expected member name");
         } else {
           type_struct_add_member(P->tc, st, name, ty);
@@ -399,6 +434,8 @@ static Type *parse_struct_or_union(Parser *P, int is_union) {
     }
     expect(P, TK_RBRACE);
     type_struct_finish(st);
+    if (tag)
+      type_tag_register(P->tc, st);
   }
   return st;
 }
@@ -458,9 +495,10 @@ static Type *parse_declaration_specifiers(Parser *P, StorageClass *sc,
   int is_unsigned = 0, is_signed = 0;
   int nlong = 0, nshort = 0;
   enum { BS_NONE, BS_VOID, BS_CHAR, BS_INT, BS_FLOAT, BS_DOUBLE, BS_BOOL,
-         BS_STRUCT, BS_ENUM } base = BS_NONE;
+         BS_STRUCT, BS_ENUM, BS_COMPLEX } base = BS_NONE;
   Type *struct_ty = NULL;
   int is_const = 0;
+  int is_complex = 0;
 
   for (;;) {
     if (match(P, TK_TYPEDEF)) {
@@ -508,6 +546,11 @@ static Type *parse_declaration_specifiers(Parser *P, StorageClass *sc,
     }
     if (match(P, TK_BOOL)) {
       base = BS_BOOL;
+      *saw_type = 1;
+      continue;
+    }
+    if (match(P, TK_COMPLEX)) {
+      is_complex = 1;
       *saw_type = 1;
       continue;
     }
@@ -595,6 +638,9 @@ static Type *parse_declaration_specifiers(Parser *P, StorageClass *sc,
   case BS_ENUM:
     ty = struct_ty;
     break;
+  case BS_COMPLEX:
+    ty = type_complex(P->tc, P->tc->ty_double);
+    break;
   case BS_INT:
   default:
     if (nshort) {
@@ -607,6 +653,12 @@ static Type *parse_declaration_specifiers(Parser *P, StorageClass *sc,
       ty = is_unsigned ? P->tc->ty_uint : P->tc->ty_int;
     }
     break;
+  }
+  if (is_complex && base != BS_COMPLEX) {
+    if (base == BS_FLOAT)
+      ty = type_complex(P->tc, P->tc->ty_float);
+    else
+      ty = type_complex(P->tc, P->tc->ty_double);
   }
   (void)is_const;
   return ty;
@@ -624,26 +676,41 @@ static Type *parse_pointers(Parser *P, Type *base) {
 static Type *parse_postfix_declarator(Parser *P, Type *base, char **out_name,
                                       Node ***out_params, int *out_variadic);
 
+/* Count how many leading TY_PTR layers sit on `t` above `root` (or pure depth). */
+static int ptr_depth_above(Type *t, Type *root) {
+  int d = 0;
+  while (t && t->kind == TY_PTR && t != root) {
+    d++;
+    t = t->base;
+    if (d > 64)
+      break;
+  }
+  return d;
+}
+
 static Type *parse_direct_declarator(Parser *P, Type *base, char **out_name,
                                      Node ***out_params, int *out_variadic) {
   Type *stub = base;
   if (match(P, TK_LPAREN)) {
-    /* could be parenthesized declarator or function params after abstract */
-    if (is_type_token(P) || check(P, TK_RPAREN) || check(P, TK_STAR)) {
-      /* ambiguous: (type) vs (declarator). If starts with type or ) or *,
-       * might still be nested declarator starting with *. Prefer nested
-       * declarator if TK_STAR or IDENT or LPAREN. */
+    if (is_type_token(P) || check(P, TK_RPAREN) || check(P, TK_STAR) ||
+        check(P, TK_IDENT) || check(P, TK_LPAREN)) {
       if (check(P, TK_STAR) || check(P, TK_IDENT) ||
           (check(P, TK_LPAREN) && !is_type_token(P))) {
-        Type *inner = parse_declarator(P, base, out_name, out_params, out_variadic);
+        /* Parenthesized declarator: postfix outside applies to the base type
+         * first; pointer layers from the nested declarator wrap the result.
+         * This makes `int (*fp)(int)` a pointer-to-function, not a function
+         * returning pointer. */
+        Type *inner =
+            parse_declarator(P, base, out_name, out_params, out_variadic);
         expect(P, TK_RPAREN);
-        stub = parse_postfix_declarator(P, inner, out_name, out_params,
-                                        out_variadic);
-        return stub;
+        int stars = ptr_depth_above(inner, base);
+        Type *post = parse_postfix_declarator(P, base, out_name, out_params,
+                                              out_variadic);
+        for (int i = 0; i < stars; i++)
+          post = type_ptr(P->tc, post);
+        return post;
       }
     }
-    /* function parameter list applied later — shouldn't get here without name */
-    /* fall through as nested empty */
     expect(P, TK_RPAREN);
   }
   if (check(P, TK_IDENT)) {
@@ -713,6 +780,8 @@ static Type *parse_param_list(Parser *P, Type *ret, Node ***out_params,
   return ft;
 }
 
+static Node **g_vla_out; /* set around declarator parse for VLA size */
+
 static Type *parse_postfix_declarator(Parser *P, Type *base, char **out_name,
                                       Node ***out_params, int *out_variadic) {
   (void)out_name;
@@ -721,9 +790,20 @@ static Type *parse_postfix_declarator(Parser *P, Type *base, char **out_name,
       base = parse_param_list(P, base, out_params, out_variadic);
     } else if (match(P, TK_LBRACKET)) {
       size_t len = 0;
+      int is_vla = 0;
       if (check(P, TK_INT)) {
         len = (size_t)P->tok.ival;
         next(P);
+      } else if (!check(P, TK_RBRACKET)) {
+        Node *bound = parse_assign(P);
+        if (bound && bound->kind == EX_INT)
+          len = (size_t)bound->ival;
+        else {
+          is_vla = 1;
+          len = 0;
+          if (g_vla_out && !*g_vla_out)
+            *g_vla_out = bound;
+        }
       }
       expect(P, TK_RBRACKET);
       /* wrap: array of base, but declarators nest inside-out.
@@ -739,14 +819,18 @@ static Type *parse_postfix_declarator(Parser *P, Type *base, char **out_name,
        * So we replace: array[3] of (array[4] of element).
        */
       if (base->kind == TY_ARRAY) {
-        /* deepen: outermost stays, add inner */
         Type *inner = type_array(P->tc, base->base, len);
+        if (is_vla)
+          inner->is_vla = 1;
         base = type_array(P->tc, inner, base->array_len);
       } else if (base->kind == TY_FUNC) {
-        /* function returning array — rare */
         base = type_array(P->tc, base, len);
+        if (is_vla)
+          base->is_vla = 1;
       } else {
         base = type_array(P->tc, base, len);
+        if (is_vla)
+          base->is_vla = 1;
       }
     } else {
       break;
@@ -757,8 +841,18 @@ static Type *parse_postfix_declarator(Parser *P, Type *base, char **out_name,
 
 static Type *parse_declarator(Parser *P, Type *base, char **out_name,
                               Node ***out_params, int *out_variadic) {
+  return parse_declarator_x(P, base, out_name, out_params, out_variadic, NULL);
+}
+
+static Type *parse_declarator_x(Parser *P, Type *base, char **out_name,
+                                Node ***out_params, int *out_variadic,
+                                Node **out_vla_size) {
+  Node **prev = g_vla_out;
+  g_vla_out = out_vla_size;
   base = parse_pointers(P, base);
-  return parse_direct_declarator(P, base, out_name, out_params, out_variadic);
+  Type *t = parse_direct_declarator(P, base, out_name, out_params, out_variadic);
+  g_vla_out = prev;
+  return t;
 }
 
 static Type *parse_abstract_declarator(Parser *P, Type *base) {
@@ -794,7 +888,25 @@ static Node *parse_initializer(Parser *P) {
       do {
         if (check(P, TK_RBRACE))
           break;
-        buf_push(n->stmts, parse_initializer(P));
+        Node *item;
+        if (match(P, TK_DOT)) {
+          Token id = P->tok;
+          expect(P, TK_IDENT);
+          expect(P, TK_ASSIGN);
+          item = parse_initializer(P);
+          item->is_designated = 1;
+          item->designator = id.text;
+        } else if (match(P, TK_LBRACKET)) {
+          Node *idx = parse_cond(P);
+          expect(P, TK_RBRACKET);
+          expect(P, TK_ASSIGN);
+          item = parse_initializer(P);
+          item->is_designated = 1;
+          item->init = idx; /* reuse init for index expr */
+        } else {
+          item = parse_initializer(P);
+        }
+        buf_push(n->stmts, item);
       } while (match(P, TK_COMMA));
     }
     expect(P, TK_RBRACE);
@@ -1023,7 +1135,9 @@ static Node *parse_decl_or_stmt(Parser *P) {
   char *name = NULL;
   Node **params = NULL;
   int variadic = 0;
-  Type *ty = parse_declarator(P, base, &name, &params, &variadic);
+  Node *vla_sz = NULL;
+  Type *ty =
+      parse_declarator_x(P, base, &name, &params, &variadic, &vla_sz);
 
   /* function definition */
   if (ty->kind == TY_FUNC && check(P, TK_LBRACE)) {
@@ -1053,6 +1167,7 @@ static Node *parse_decl_or_stmt(Parser *P) {
     d->decl_type = ty;
     d->type = ty;
     d->storage = sc;
+    d->rhs = vla_sz;
     if (match(P, TK_ASSIGN))
       d->init = parse_initializer(P);
 
@@ -1067,7 +1182,8 @@ static Node *parse_decl_or_stmt(Parser *P) {
     name = NULL;
     params = NULL;
     variadic = 0;
-    ty = parse_declarator(P, base, &name, &params, &variadic);
+    vla_sz = NULL;
+    ty = parse_declarator_x(P, base, &name, &params, &variadic, &vla_sz);
   }
   expect(P, TK_SEMI);
 

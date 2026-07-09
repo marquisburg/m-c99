@@ -23,8 +23,10 @@ typedef enum {
   EX_SIZEOF_TYPE,
   EX_COND, /* ?: */
   EX_COMMA,
-  EX_COMPOUND_LITERAL, /* (T){...} limited */
+  EX_COMPOUND_LITERAL,
   EX_INIT_LIST,
+  EX_DESIGNATOR, /* .field or [index] wrapper around init value */
+  EX_BUILTIN,    /* __builtin_va_*, __real__, __imag__, etc. */
 
   /* statements */
   ST_EXPR,
@@ -136,11 +138,15 @@ struct Node {
   int is_variadic;
   int is_arrow; /* member access -> */
   int enum_val;
+  int bit_width; /* bit-field width in member decl; -1 if none */
+  int is_designated; /* init has .name = */
+  const char *designator; /* field name for designated init */
 
   /* semantic / lowering hooks */
   struct Symbol *sym;
   int local_slot; /* filled by lowerer */
   Node **cases;   /* switch case list */
+  int fptr_id;    /* function pointer id for lower */
 };
 
 typedef struct {

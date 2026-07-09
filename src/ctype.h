@@ -27,6 +27,7 @@ typedef enum {
   TY_STRUCT,
   TY_UNION,
   TY_ENUM,
+  TY_COMPLEX, /* _Complex float/double; base is float or double element */
 } TypeKind;
 
 typedef struct Type Type;
@@ -34,6 +35,9 @@ typedef struct StructMember {
   const char *name;
   Type *type;
   size_t offset;
+  int is_bitfield;
+  int bit_offset; /* bit offset within the containing storage unit */
+  int bit_width;
 } StructMember;
 
 struct Type {
@@ -62,6 +66,9 @@ struct Type {
 
 typedef struct {
   Arena *arena;
+  /* tag namespace: struct/union/enum name -> Type* */
+  Type **tags;
+  size_t ntags;
   /* cached primitives */
   Type *ty_void;
   Type *ty_bool;
@@ -82,6 +89,8 @@ typedef struct {
 } TypeContext;
 
 void type_context_init(TypeContext *tc, Arena *arena);
+Type *type_tag_lookup(TypeContext *tc, const char *tag, int is_union);
+void type_tag_register(TypeContext *tc, Type *t);
 
 Type *type_ptr(TypeContext *tc, Type *base);
 Type *type_array(TypeContext *tc, Type *base, size_t len);
@@ -90,7 +99,10 @@ Type *type_func(TypeContext *tc, Type *ret, Type **params, size_t nparams,
 Type *type_struct_create(TypeContext *tc, const char *tag, int is_union);
 void type_struct_add_member(TypeContext *tc, Type *st, const char *name,
                             Type *mty);
+void type_struct_add_bitfield(TypeContext *tc, Type *st, const char *name,
+                              Type *mty, int width);
 void type_struct_finish(Type *st);
+Type *type_complex(TypeContext *tc, Type *real_ty);
 
 int type_is_integer(const Type *t);
 int type_is_unsigned(const Type *t);
