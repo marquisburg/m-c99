@@ -22,6 +22,7 @@ typedef struct Symbol {
   int is_global;
   int is_static; /* internal linkage */
   int is_defined;
+  int address_taken; /* &obj appears; forces addressable storage */
   struct Symbol *next; /* hash chain */
 } Symbol;
 

@@ -239,12 +239,30 @@ static Node *parse_unary(Parser *P) {
     return n;
   }
   if (match(P, TK_SIZEOF)) {
-    if (match(P, TK_LPAREN) && is_type_token(P)) {
-      Type *ty = parse_type_name(P);
-      expect(P, TK_RPAREN);
-      Node *n = node_new(P->arena, EX_SIZEOF_TYPE, loc);
-      n->decl_type = ty;
-      return n;
+    /* sizeof ( type-name ) vs sizeof unary-expr — do not consume '(' until
+     * we know which form it is (otherwise sizeof(a[0]) loses a paren). */
+    if (check(P, TK_LPAREN)) {
+      Token peek = lookahead(P);
+      Parser save;
+      /* type-name starts with a type token after '(' */
+      if (/* after lparen */ 1) {
+        next(P); /* ( */
+        if (is_type_token(P)) {
+          Type *ty = parse_type_name(P);
+          expect(P, TK_RPAREN);
+          Node *n = node_new(P->arena, EX_SIZEOF_TYPE, loc);
+          n->decl_type = ty;
+          return n;
+        }
+        /* sizeof ( expr ) — parse expr then ')' */
+        Node *inner = parse_expr(P);
+        expect(P, TK_RPAREN);
+        Node *n = node_new(P->arena, EX_SIZEOF_EXPR, loc);
+        n->lhs = inner;
+        return n;
+      }
+      (void)peek;
+      (void)save;
     }
     Node *n = node_new(P->arena, EX_SIZEOF_EXPR, loc);
     n->lhs = parse_unary(P);
@@ -440,6 +458,106 @@ static Type *parse_struct_or_union(Parser *P, int is_union) {
   return st;
 }
 
+/* Integer constant-expression subset for enumerators (C99 6.6). */
+static long long parse_const_unary(Parser *P);
+static long long parse_const_mul(Parser *P);
+static long long parse_const_add(Parser *P);
+static long long parse_const_shift(Parser *P);
+static long long parse_const_or(Parser *P);
+
+static long long parse_const_primary(Parser *P) {
+  if (check(P, TK_INT) || check(P, TK_CHAR)) {
+    long long v = P->tok.ival;
+    next(P);
+    return v;
+  }
+  if (match(P, TK_LPAREN)) {
+    long long v = parse_const_or(P);
+    expect(P, TK_RPAREN);
+    return v;
+  }
+  if (check(P, TK_IDENT)) {
+    /* enumerator ref: look up later enumerators not yet visible; 0 if unknown */
+    /* Best-effort: leave 0 — prior enumerators registered only after finish. */
+    next(P);
+    return 0;
+  }
+  diag_error(P->diag, P->tok.loc, "expected integer constant expression");
+  next(P);
+  return 0;
+}
+
+static long long parse_const_unary(Parser *P) {
+  if (match(P, TK_PLUS))
+    return parse_const_unary(P);
+  if (match(P, TK_MINUS))
+    return -parse_const_unary(P);
+  if (match(P, TK_TILDE))
+    return ~parse_const_unary(P);
+  if (match(P, TK_BANG))
+    return !parse_const_unary(P);
+  return parse_const_primary(P);
+}
+
+static long long parse_const_mul(Parser *P) {
+  long long v = parse_const_unary(P);
+  for (;;) {
+    if (match(P, TK_STAR))
+      v *= parse_const_unary(P);
+    else if (match(P, TK_SLASH)) {
+      long long r = parse_const_unary(P);
+      v = r ? v / r : 0;
+    } else if (match(P, TK_PERCENT)) {
+      long long r = parse_const_unary(P);
+      v = r ? v % r : 0;
+    } else
+      break;
+  }
+  return v;
+}
+
+static long long parse_const_add(Parser *P) {
+  long long v = parse_const_mul(P);
+  for (;;) {
+    if (match(P, TK_PLUS))
+      v += parse_const_mul(P);
+    else if (match(P, TK_MINUS))
+      v -= parse_const_mul(P);
+    else
+      break;
+  }
+  return v;
+}
+
+static long long parse_const_shift(Parser *P) {
+  long long v = parse_const_add(P);
+  for (;;) {
+    if (match(P, TK_LSHIFT))
+      v <<= (int)parse_const_add(P);
+    else if (match(P, TK_RSHIFT))
+      v >>= (int)parse_const_add(P);
+    else
+      break;
+  }
+  return v;
+}
+
+static long long parse_const_or(Parser *P) {
+  /* Include | ^ & for enum defs like (1|2) */
+  long long v = parse_const_shift(P);
+  for (;;) {
+    if (match(P, TK_AMP))
+      v &= parse_const_shift(P);
+    else if (match(P, TK_CARET))
+      v ^= parse_const_shift(P);
+    else if (match(P, TK_PIPE))
+      v |= parse_const_shift(P);
+    else
+      break;
+  }
+  return v;
+}
+
 static Type *parse_enum(Parser *P) {
   next(P); /* enum */
   const char *tag = NULL;
@@ -457,21 +575,8 @@ static Type *parse_enum(Parser *P) {
     while (!check(P, TK_RBRACE) && !check(P, TK_EOF)) {
       Token id = P->tok;
       expect(P, TK_IDENT);
-      if (match(P, TK_ASSIGN)) {
-        /* constant expr: only int literal for now */
-        if (check(P, TK_INT) || check(P, TK_CHAR)) {
-          val = P->tok.ival;
-          next(P);
-        } else if (check(P, TK_MINUS)) {
-          next(P);
-          if (check(P, TK_INT)) {
-            val = -P->tok.ival;
-            next(P);
-          }
-        } else {
-          diag_error(P->diag, P->tok.loc, "expected integer constant in enum");
-        }
-      }
+      if (match(P, TK_ASSIGN))
+        val = parse_const_or(P);
       /* stash enumerator as a synthetic global-ish via D_ENUM node later —
        * return list through tag type's members abuse: */
       StructMember m;
@@ -1212,7 +1317,19 @@ Program *parse_program(Parser *P) {
       next(P);
       Node *n = node_new(P->arena, D_STRUCT, P->tok.loc);
       n->decl_type = base;
+      n->type = base;
       buf_push(prog->decls, n);
+      /* Bare enum E { A = -1, ... }; must introduce enumerators. */
+      if (base && base->kind == TY_ENUM) {
+        for (size_t ei = 0; ei < buf_len(base->members); ei++) {
+          Node *en = node_new(P->arena, D_ENUM, n->loc);
+          en->name = base->members[ei].name;
+          en->ival = (long long)base->members[ei].offset;
+          en->type = base;
+          en->decl_type = base;
+          buf_push(prog->decls, en);
+        }
+      }
       continue;
     }
 

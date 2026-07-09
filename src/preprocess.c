@@ -541,6 +541,23 @@ static char *expand_line(PP *pp, const char *path, int line, const char *in,
   char *out = NULL;
   size_t i = 0;
   while (i < n) {
+    /* Do not expand inside comments (C: comments are spaces before macros). */
+    if (in[i] == '/' && i + 1 < n && in[i + 1] == '/') {
+      while (i < n)
+        buf_push(out, in[i++]);
+      break;
+    }
+    if (in[i] == '/' && i + 1 < n && in[i + 1] == '*') {
+      buf_push(out, in[i++]);
+      buf_push(out, in[i++]);
+      while (i + 1 < n && !(in[i] == '*' && in[i + 1] == '/'))
+        buf_push(out, in[i++]);
+      if (i + 1 < n) {
+        buf_push(out, in[i++]);
+        buf_push(out, in[i++]);
+      }
+      continue;
+    }
     if (in[i] == '"' || in[i] == '\'') {
       char q = in[i++];
       buf_push(out, q);
@@ -717,12 +734,8 @@ static void install_predefs(PP *pp) {
     m->predefined = 1;
     macro_define(pp, m);
   }
-  /* I for complex */
-  Macro *mi = (Macro *)arena_calloc(pp->arena, sizeof(Macro));
-  mi->name = arena_strdup(pp->arena, "I");
-  mi->body = arena_strdup(pp->arena, "(__c99m_I)");
-  mi->predefined = 1;
-  macro_define(pp, mi);
+  /* Complex imaginary unit: only if user includes complex support.
+   * Do NOT predefine bare `I` — it corrupts identifiers/comments (e.g. -I). */
 }
 
 static char *preprocess_buffer(PP *pp, const char *path, const char *src0,

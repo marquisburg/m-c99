@@ -207,6 +207,17 @@ int main(int argc, char **argv) {
   memset(&ppopt, 0, sizeof(ppopt));
   ppopt.arena = &arena;
   ppopt.diag = &diag;
+  /* Default system include: <repo>/include (freestanding + CRT decls). */
+  {
+    char *def_inc = NULL;
+#ifdef _WIN32
+    /* Prefer relative include/ next to cwd (project root when built). */
+    def_inc = "include";
+#else
+    def_inc = "include";
+#endif
+    buf_push(include_paths, def_inc);
+  }
   ppopt.paths = include_paths;
 
   if (preprocess_only) {

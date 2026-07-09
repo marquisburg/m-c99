@@ -298,6 +298,10 @@ static Type *check_expr(Sema *S, Node *e) {
       if (!is_lvalue(e->lhs) && e->lhs->kind != EX_IDENT) {
         /* allow addr of ident always */
       }
+      /* Mark object as address-taken so lowering picks addressable storage
+       * (needed for globals: libmtlc address_of is local/param-oriented). */
+      if (e->lhs->kind == EX_IDENT && e->lhs->sym)
+        e->lhs->sym->address_taken = 1;
       e->type = type_ptr(S->tc, e->lhs->type ? e->lhs->type : t);
       return e->type;
     case OP_DEREF:
@@ -434,9 +438,16 @@ static Type *check_expr(Sema *S, Node *e) {
     return e->type;
   }
   case EX_SIZEOF_EXPR: {
+    /* sizeof does not decay arrays/functions */
     check_expr(S, e->lhs);
     e->type = S->tc->ty_ullong;
-    e->ival = (long long)(e->lhs->type ? e->lhs->type->size : 0);
+    {
+      Type *st = e->lhs->type;
+      if (st && st->kind == TY_ARRAY && st->array_len && st->base)
+        e->ival = (long long)(st->array_len * st->base->size);
+      else
+        e->ival = (long long)(st ? st->size : 0);
+    }
     return e->type;
   }
   case EX_SIZEOF_TYPE: {

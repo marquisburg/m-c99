@@ -1,3 +1,5 @@
+#include <complex.h>
+
 int main(void) {
   _Complex double z = 3.0 + 4.0 * I;
   double r = __real__(z);

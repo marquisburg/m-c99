@@ -50,6 +50,9 @@ typedef struct {
   /* global aggregate names that need lazy malloc */
   char **agg_globals;
   size_t *agg_global_sizes;
+  /* file-scope pointer globals needing runtime string init */
+  Node **global_str_inits;
+  int need_global_init_call;
 } Lower;
 
 static const MtlcType *mtlc_of(Type *t);
@@ -316,7 +319,8 @@ static const char *sym_link(Symbol *sym) {
   return sym->link_name ? sym->link_name : sym->name;
 }
 
-/* Ensure file-scope aggregate global pointer is allocated and zeroed. */
+/* Ensure file-scope object-pointer global is allocated and zeroed.
+ * Used for aggregates and for scalar globals that have their address taken. */
 static MtlcValue ensure_agg_global(Lower *L, const char *name, size_t bytes) {
   const MtlcType *i8p = i8p_ty();
   MtlcValue g = mtlc_global_ref(L->fn, name);
@@ -332,6 +336,12 @@ static MtlcValue ensure_agg_global(Lower *L, const char *name, size_t bytes) {
   }
   mtlc_label(L->fn, done);
   return mtlc_global_ref(L->fn, name);
+}
+
+static int is_addr_global(Symbol *sym) {
+  return sym && sym->is_global &&
+         (sym->address_taken ||
+          (sym->type && (is_agg(sym->type) || sym->type->kind == TY_ARRAY)));
 }
 
 /* String as packed little-endian u64 globals (true data, no runtime fill). */
@@ -404,8 +414,9 @@ static MtlcValue gen_lvalue_addr(Lower *L, Node *e) {
     if (p != MTLC_NO_VALUE)
       return p;
     if (e->sym->is_global) {
-      if (is_agg(e->type) || (e->type && e->type->kind == TY_ARRAY)) {
-        size_t sz = e->type && e->type->size ? e->type->size : 8;
+      if (is_addr_global(e->sym)) {
+        size_t sz = e->sym->type && e->sym->type->size ? e->sym->type->size
+                                                       : (e->type && e->type->size ? e->type->size : 8);
         return ensure_agg_global(L, ln ? ln : e->name, sz);
       }
       MtlcValue g = mtlc_global_ref(L->fn, ln ? ln : e->name);
@@ -715,22 +726,23 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
       }
       return mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_INT64), id);
     }
+    /* ptr_of locals always hold the base address of array/struct/complex
+     * storage. After array-to-pointer decay the AST type is TY_PTR — still
+     * return that address. Never mtlc_load through it (that would deref). */
     MtlcValue p = ptr_of(L, e->sym);
-    if (p != MTLC_NO_VALUE) {
-      if (e->type && e->type->kind == TY_ARRAY)
-        return p;
-      if (e->type && (e->type->kind == TY_STRUCT || e->type->kind == TY_UNION ||
-                      e->type->kind == TY_COMPLEX))
-        return p;
-      return mtlc_load(L->fn, p, mtlc_of(e->type));
-    }
+    if (p != MTLC_NO_VALUE)
+      return p;
     if (e->sym->is_global) {
-      if (is_agg(e->type) || (e->type && e->type->kind == TY_ARRAY)) {
-        size_t sz = e->type && e->type->size ? e->type->size : 8;
-        return ensure_agg_global(L, sym_link(e->sym) ? sym_link(e->sym) : e->name,
-                                sz);
+      const char *ln = sym_link(e->sym) ? sym_link(e->sym) : e->name;
+      if (is_addr_global(e->sym)) {
+        size_t sz = e->sym->type && e->sym->type->size ? e->sym->type->size : 8;
+        MtlcValue base = ensure_agg_global(L, ln, sz);
+        if (is_agg(e->type) || (e->type && e->type->kind == TY_ARRAY))
+          return base;
+        /* Scalar global with address taken: load through pointer storage. */
+        return mtlc_load(L->fn, base, mtlc_of(e->type));
       }
-      return mtlc_global_ref(L->fn, sym_link(e->sym) ? sym_link(e->sym) : e->name);
+      return mtlc_global_ref(L->fn, ln);
     }
     return local_of(L, e->sym);
   }
@@ -1001,12 +1013,19 @@ static MtlcValue gen_expr(Lower *L, Node *e) {
       return loc;
     }
     if (e->lhs->kind == EX_IDENT && e->lhs->sym && e->lhs->sym->is_global &&
-        !is_agg(e->lhs->type)) {
+        !is_agg(e->lhs->type) && !e->lhs->sym->address_taken) {
       const char *ln = sym_link(e->lhs->sym);
       MtlcValue g = mtlc_global_ref(L->fn, ln ? ln : e->lhs->name);
       rhs = cast_to(L, rhs, e->rhs->type, e->lhs->type);
       mtlc_assign(L->fn, g, rhs);
       return g;
+    }
+    if (e->lhs->kind == EX_IDENT && e->lhs->sym && e->lhs->sym->is_global &&
+        e->lhs->sym->address_taken && !is_agg(e->lhs->type)) {
+      MtlcValue addr = gen_lvalue_addr(L, e->lhs);
+      rhs = cast_to(L, rhs, e->rhs->type, e->lhs->type);
+      mtlc_store(L->fn, addr, rhs, mtlc_of(e->lhs->type));
+      return rhs;
     }
     MtlcValue addr = gen_lvalue_addr(L, e->lhs);
     if (e->lhs->type && e->lhs->type->kind == TY_COMPLEX) {
@@ -1251,51 +1270,76 @@ static void gen_var_decl(Lower *L, Node *d) {
   }
 }
 
-/* Flatten switch body for fall-through: emit labels at case/default and
- * statements in order. */
+/* Evaluate case label constant (char/int). */
+static long long case_value(Node *e) {
+  if (!e)
+    return 0;
+  if (e->kind == EX_INT || e->kind == EX_CHAR)
+    return e->ival;
+  if (e->kind == EX_IDENT && e->sym && e->sym->kind == SYM_ENUM_CONST)
+    return e->sym->enum_val;
+  return e->ival;
+}
+
+/*
+ * Flatten switch body. Parser nests `case A: case B: stmt` as
+ * CASE(A, body=CASE(B, body=stmt)). Unwrap so every label is a peer and
+ * share the same statement index (C multi-case labels).
+ */
 static void gen_switch(Lower *L, Node *st) {
   MtlcValue cv = gen_expr(L, st->cond);
   char *end = fresh_label(L, "swend");
   LoopCtx ctx = {end, L->loop ? L->loop->continue_l : end, L->loop};
   L->loop = &ctx;
 
-  Node **flat = NULL;
+  Node **raw = NULL;
   if (st->body && st->body->kind == ST_COMPOUND) {
     for (size_t i = 0; i < buf_len(st->body->stmts); i++)
-      buf_push(flat, st->body->stmts[i]);
+      buf_push(raw, st->body->stmts[i]);
   } else if (st->body) {
-    buf_push(flat, st->body);
+    buf_push(raw, st->body);
   }
 
-  /* Expand ST_CASE/ST_DEFAULT that wrap a following stmt only */
+  /* flat_stmts[i] = executable stmt; labels point at an index into flat_stmts */
+  Node **flat_stmts = NULL;
   char **case_labels = NULL;
   long long *case_vals = NULL;
   size_t *case_stmt_index = NULL;
   char *def_label = NULL;
   size_t def_index = (size_t)-1;
 
-  for (size_t i = 0; i < buf_len(flat); i++) {
-    Node *s = flat[i];
-    if (s->kind == ST_CASE) {
-      char *l = fresh_label(L, "case");
-      buf_push(case_labels, l);
-      long long v = 0;
-      if (s->lhs && s->lhs->kind == EX_INT)
-        v = s->lhs->ival;
-      else if (s->lhs)
-        v = s->lhs->ival;
-      buf_push(case_vals, v);
-      buf_push(case_stmt_index, i);
-    } else if (s->kind == ST_DEFAULT) {
-      def_label = fresh_label(L, "default");
-      def_index = i;
+  for (size_t i = 0; i < buf_len(raw); i++) {
+    Node *s = raw[i];
+    /* Unwrap leading case/default chain. */
+    Node **labels = NULL; /* ST_CASE / ST_DEFAULT nodes */
+    while (s && (s->kind == ST_CASE || s->kind == ST_DEFAULT)) {
+      buf_push(labels, s);
+      s = s->body;
     }
+    size_t stmt_i = buf_len(flat_stmts);
+    buf_push(flat_stmts, s); /* may be NULL for empty case */
+
+    for (size_t li = 0; li < buf_len(labels); li++) {
+      Node *lb = labels[li];
+      if (lb->kind == ST_CASE) {
+        char *l = fresh_label(L, "case");
+        buf_push(case_labels, l);
+        buf_push(case_vals, case_value(lb->lhs));
+        buf_push(case_stmt_index, stmt_i);
+      } else if (lb->kind == ST_DEFAULT) {
+        def_label = fresh_label(L, "default");
+        def_index = stmt_i;
+      }
+    }
+    buf_free(labels);
   }
+  buf_free(raw);
 
   /* dispatch */
   for (size_t i = 0; i < buf_len(case_labels); i++) {
     MtlcValue k =
         mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_INT32), case_vals[i]);
+    /* char cases: compare as int (already 0..255 / signed char value) */
     MtlcValue eq =
         mtlc_binary(L->fn, "==", cv, k, mtlc_type_scalar(MTLC_TYPE_INT32));
     char *next = fresh_label(L, "swn");
@@ -1308,26 +1352,20 @@ static void gen_switch(Lower *L, Node *st) {
   else
     mtlc_jump(L->fn, end);
 
-  /* body with fall-through */
-  for (size_t i = 0; i < buf_len(flat); i++) {
+  /* body with fall-through across cases */
+  for (size_t i = 0; i < buf_len(flat_stmts); i++) {
     for (size_t c = 0; c < buf_len(case_stmt_index); c++)
       if (case_stmt_index[c] == i)
         mtlc_label(L->fn, case_labels[c]);
     if (def_label && def_index == i)
       mtlc_label(L->fn, def_label);
-
-    Node *s = flat[i];
-    if (s->kind == ST_CASE || s->kind == ST_DEFAULT) {
-      if (s->body)
-        gen_stmt(L, s->body);
-    } else {
-      gen_stmt(L, s);
-    }
+    if (flat_stmts[i])
+      gen_stmt(L, flat_stmts[i]);
   }
 
   mtlc_label(L->fn, end);
   L->loop = ctx.parent;
-  buf_free(flat);
+  buf_free(flat_stmts);
   buf_free(case_labels);
   buf_free(case_vals);
   buf_free(case_stmt_index);
@@ -1555,6 +1593,11 @@ static void gen_function(Lower *L, Node *fn) {
   if (is_var)
     L->va_param = mtlc_fn_param(mf, arg0 + nparams);
 
+  /* Run file-scope string-pointer constructors before user main. */
+  if (L->need_global_init_call && fn->name && strcmp(fn->name, "main") == 0)
+    mtlc_call(mf, "__c99m_init_globals", NULL, 0,
+              mtlc_type_scalar(MTLC_TYPE_VOID));
+
   gen_stmt(L, fn->body);
 
   if (!L->emitted_return) {
@@ -1589,12 +1632,20 @@ MtlcModule *lower_program(Sema *S, Program *prog, Diag *diag) {
       if (d->init && d->init->kind == EX_INT)
         init = d->init->ival;
       int is_extern = d->storage == SC_EXTERN;
-      /* Aggregates and arrays: pointer globals, lazily malloc'd on first use. */
-      if (is_agg(d->type) || (d->type && d->type->kind == TY_ARRAY)) {
+      /* Aggregates, arrays, and address-taken scalars: pointer globals,
+       * lazily malloc'd on first use (stable addresses for &g). */
+      int addr_obj = is_agg(d->type) || (d->type && d->type->kind == TY_ARRAY) ||
+                     (d->sym && d->sym->address_taken);
+      if (addr_obj) {
         mtlc_builder_global(L.builder, d->name, i8p_ty(), 0, is_extern);
         buf_push(L.agg_globals, d->name);
         size_t sz = d->type && d->type->size ? d->type->size : 8;
         buf_push(L.agg_global_sizes, sz);
+      } else if (d->init && d->init->kind == EX_STRING && d->type &&
+                 d->type->kind == TY_PTR) {
+        /* const char *g = "hi"; — set pointer at startup in init helper */
+        mtlc_builder_global(L.builder, d->name, mtlc_of(d->type), 0, is_extern);
+        buf_push(L.global_str_inits, d);
       } else {
         mtlc_builder_global(L.builder, d->name, mtlc_of(d->type), init,
                             is_extern);
@@ -1625,6 +1676,31 @@ MtlcModule *lower_program(Sema *S, Program *prog, Diag *diag) {
         const MtlcType *rt = is_sret ? i8p_ty() : mtlc_of(ft->base);
         mtlc_builder_function(L.builder, d->name, rt, pnames, ptypes, irn, 1);
       }
+    }
+  }
+
+  /* Runtime ctor for file-scope string pointer globals. */
+  if (buf_len(L.global_str_inits) > 0) {
+    L.need_global_init_call = 1;
+    MtlcFn *initfn = mtlc_builder_function(
+        L.builder, "__c99m_init_globals", mtlc_type_scalar(MTLC_TYPE_VOID), NULL,
+        NULL, 0, 0);
+    if (initfn) {
+      L.fn = initfn;
+      L.nlocals = 0;
+      L.local_syms = NULL;
+      L.local_vals = NULL;
+      L.nptrs = 0;
+      L.has_va = 0;
+      L.has_sret = 0;
+      L.emitted_return = 0;
+      for (size_t gi = 0; gi < buf_len(L.global_str_inits); gi++) {
+        Node *d = L.global_str_inits[gi];
+        MtlcValue s = gen_string(&L, d->init->str, d->init->str_len);
+        MtlcValue g = mtlc_global_ref(L.fn, d->name);
+        mtlc_assign(L.fn, g, s);
+      }
+      mtlc_return(initfn, MTLC_NO_VALUE);
     }
   }
 
