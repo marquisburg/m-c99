@@ -228,18 +228,70 @@ static const MtlcType *i8p_ty(void) {
   return mtlc_type_pointer(mtlc_type_scalar(MTLC_TYPE_UINT8));
 }
 
-/* Contiguous storage via malloc blocks (libmtlc has no aggregate stack slots). */
-static MtlcValue alloc_bytes(Lower *L, size_t bytes, int is_vla,
-                             MtlcValue vla_bytes) {
+/*
+ * Immortal blob type of `bytes` for stack allocation via mtlc_local.
+ * libmtlc honors custom size/alignment on DECLARE_LOCAL when the type is
+ * registered by name (builder finish registers every type it sees).
+ */
+typedef struct BlobType {
+  size_t bytes;
+  MtlcType ty;
+  char name[32];
+  struct BlobType *next;
+} BlobType;
+
+static BlobType *blob_types; /* process-lifetime freelist */
+
+static const MtlcType *blob_type(size_t bytes) {
+  if (bytes == 0)
+    bytes = 1;
+  /* Align up to 8 for natural pointer/stack alignment. */
+  size_t aligned = (bytes + 7u) & ~7u;
+  for (BlobType *b = blob_types; b; b = b->next)
+    if (b->bytes == aligned)
+      return &b->ty;
+  BlobType *b = (BlobType *)calloc(1, sizeof(BlobType));
+  if (!b)
+    fatal("out of memory");
+  b->bytes = aligned;
+  snprintf(b->name, sizeof(b->name), "blob%zu", aligned);
+  b->ty.kind = MTLC_TYPE_ARRAY;
+  b->ty.name = b->name;
+  b->ty.size = aligned;
+  b->ty.alignment = 8;
+  b->ty.base_type = (MtlcType *)mtlc_type_scalar(MTLC_TYPE_UINT8);
+  b->ty.array_size = aligned;
+  b->next = blob_types;
+  blob_types = b;
+  return &b->ty;
+}
+
+/* Stack object: local of blob type + address. Contiguous, no malloc. */
+static MtlcValue stack_bytes(Lower *L, size_t bytes, const char *name) {
+  const MtlcType *bt = blob_type(bytes);
+  const MtlcType *i8p = i8p_ty();
+  char *nm = name ? (char *)name : fresh_tmp(L, "stk");
+  MtlcValue loc = mtlc_local(L->fn, nm, bt);
+  return mtlc_address_of(L->fn, loc, i8p);
+}
+
+/* Heap allocation (VLAs, persistent globals). */
+static MtlcValue heap_bytes(Lower *L, size_t bytes, MtlcValue dyn_bytes) {
   const MtlcType *i8p = i8p_ty();
   const MtlcType *u64 = mtlc_type_scalar(MTLC_TYPE_UINT64);
-  if (is_vla) {
-    MtlcValue args[1] = {vla_bytes};
-    return mtlc_call(L->fn, "malloc", args, 1, i8p);
-  }
-  MtlcValue n = mtlc_const_int(L->fn, u64, (long long)(bytes ? bytes : 1));
+  MtlcValue n = (dyn_bytes != MTLC_NO_VALUE)
+                    ? dyn_bytes
+                    : mtlc_const_int(L->fn, u64, (long long)(bytes ? bytes : 1));
   MtlcValue args[1] = {n};
   return mtlc_call(L->fn, "malloc", args, 1, i8p);
+}
+
+/* Fixed-size objects: stack. Dynamic size: heap. */
+static MtlcValue alloc_bytes(Lower *L, size_t bytes, int is_vla,
+                             MtlcValue vla_bytes) {
+  if (is_vla)
+    return heap_bytes(L, 0, vla_bytes);
+  return stack_bytes(L, bytes ? bytes : 1, NULL);
 }
 
 /* Zero `n` bytes at addr (C99 aggregate default zero). Unrolled for small n. */
@@ -330,7 +382,8 @@ static MtlcValue ensure_agg_global(Lower *L, const char *name, size_t bytes) {
   mtlc_jump(L->fn, done);
   mtlc_label(L->fn, need);
   {
-    MtlcValue mem = alloc_bytes(L, bytes ? bytes : 1, 0, MTLC_NO_VALUE);
+    /* Globals need heap (or static data); stack would dangle after return. */
+    MtlcValue mem = heap_bytes(L, bytes ? bytes : 1, MTLC_NO_VALUE);
     mem_zero(L, mem, bytes ? bytes : 1);
     mtlc_assign(L->fn, g, mem);
   }
@@ -344,7 +397,13 @@ static int is_addr_global(Symbol *sym) {
           (sym->type && (is_agg(sym->type) || sym->type->kind == TY_ARRAY)));
 }
 
-/* String as packed little-endian u64 globals (true data, no runtime fill). */
+/*
+ * String literals: content packed into u64 data globals (payload in .data),
+ * then on first use copied once into a permanent heap buffer pointed to by a
+ * pointer global. Public builder cannot yield a reliable char* into .data
+ * (mtlc_address_of is defined for locals/params only; probe loads 0 from &global).
+ * Result: static duration, one malloc per unique string, no per-access fill.
+ */
 static MtlcValue gen_string(Lower *L, const char *data, size_t len) {
   for (size_t i = 0; i < buf_len(L->str_names); i++) {
     if (L->str_lens[i] == len && memcmp(L->str_contents[i], data, len) == 0)
@@ -355,22 +414,20 @@ static MtlcValue gen_string(Lower *L, const char *data, size_t len) {
   size_t total = len + 1;
   size_t words = (total + 7) / 8;
   const MtlcType *u64 = mtlc_type_scalar(MTLC_TYPE_UINT64);
-  const MtlcType *i8p =
-      mtlc_type_pointer(mtlc_type_scalar(MTLC_TYPE_INT8));
+  const MtlcType *i8 = mtlc_type_scalar(MTLC_TYPE_INT8);
+  const MtlcType *i8p = mtlc_type_pointer(i8);
 
   for (size_t w = 0; w < words; w++) {
     unsigned long long pack = 0;
     for (size_t b = 0; b < 8; b++) {
       size_t idx = w * 8 + b;
-      unsigned char ch = (idx < total) ? (idx < len ? (unsigned char)data[idx] : 0) : 0;
+      unsigned char ch =
+          (idx < total) ? (idx < len ? (unsigned char)data[idx] : 0) : 0;
       pack |= ((unsigned long long)ch) << (8 * b);
     }
     char *wn = arena_sprintf(L->arena, "%s_%zu", base, w);
     mtlc_builder_global(L->builder, wn, u64, (long long)pack, 0);
   }
-  /* Export pointer global initialized at runtime once from &word0.
-   * Without address-of-global-as-rodata in builder, materialize:
-   * store each byte into a BSS buffer global pointer. */
   char *ptrname = arena_sprintf(L->arena, "%s_p", base);
   mtlc_builder_global(L->builder, ptrname, i8p, 0, 0);
 
@@ -381,22 +438,18 @@ static MtlcValue gen_string(Lower *L, const char *data, size_t len) {
   mtlc_jump(L->fn, done);
   mtlc_label(L->fn, need);
   {
-    /* Copy packed words into a malloc buffer so bytes are contiguous. */
-    MtlcValue n = mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_UINT64),
-                                 (long long)total);
-    MtlcValue args[1] = {n};
-    MtlcValue mem = mtlc_call(L->fn, "malloc", args, 1, i8p);
+    /* Materialize once into permanent heap; bytes come from compile-time
+     * constants (data globals above document payload / aid tooling dumps). */
+    MtlcValue mem = heap_bytes(L, total, MTLC_NO_VALUE);
     for (size_t i = 0; i < total; i++) {
       unsigned char ch = (i < len) ? (unsigned char)data[i] : 0;
-      MtlcValue off =
-          mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_UINT64), (long long)i);
+      MtlcValue off = mtlc_const_int(L->fn, u64, (long long)i);
       MtlcValue addr = mtlc_binary(L->fn, "+", mem, off, i8p);
-      mtlc_store(L->fn, addr,
-                 mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_INT8), ch),
-                 mtlc_type_scalar(MTLC_TYPE_INT8));
+      mtlc_store(L->fn, addr, mtlc_const_int(L->fn, i8, ch), i8);
     }
     mtlc_assign(L->fn, g, mem);
   }
+  (void)words;
   mtlc_label(L->fn, done);
   buf_push(L->str_names, ptrname);
   buf_push(L->str_contents, arena_strndup(L->arena, data, len));
@@ -1222,14 +1275,16 @@ static void gen_var_decl(Lower *L, Node *d) {
           mtlc_const_int(L->fn, mtlc_type_scalar(MTLC_TYPE_UINT64), (long long)esz);
       MtlcValue nb = mtlc_binary(L->fn, "*", count, es,
                                  mtlc_type_scalar(MTLC_TYPE_UINT64));
-      mem = alloc_bytes(L, 0, 1, nb);
-      /* VLA has indeterminate values unless assigned; leave unzeroed. */
+      mem = heap_bytes(L, 0, nb);
+      /* VLA: indeterminate until written. */
     } else {
-      mem = alloc_bytes(L, bytes ? bytes : 1, 0, MTLC_NO_VALUE);
+      /* Fixed array/struct/complex: true stack blob (no malloc). */
+      mem = stack_bytes(L, bytes ? bytes : 1, d->name);
       mem_zero(L, mem, bytes ? bytes : 1);
     }
-    MtlcValue loc =
-        mtlc_local(L->fn, d->name, i8p_ty());
+    /* Keep a pointer local to the object for indexing and decay. */
+    MtlcValue loc = mtlc_local(L->fn, arena_sprintf(L->arena, "%s_p", d->name),
+                               i8p_ty());
     mtlc_assign(L->fn, loc, mem);
     bind_local(L, d->sym, loc);
     bind_ptr(L, d->sym, loc);
