@@ -9,4 +9,9 @@ int _rmdir(const char *path);
 int _chdir(const char *path);
 char *_getcwd(char *buf, int n);
 
+/* POSIX spellings (MinGW's direct.h provides these too) */
+#define mkdir(path) _mkdir(path)
+#define getcwd _getcwd
+#define chdir _chdir
+
 #endif /* _DIRECT_H */

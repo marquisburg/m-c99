@@ -63,6 +63,7 @@ void *bsearch(const void *key, const void *base, size_t n, size_t sz,
               int (*cmp)(const void *, const void *));
 
 char *_fullpath(char *buf, const char *path, size_t n);
+int _get_pgmptr(char **value);
 #define realpath(path, buf) _fullpath((buf), (path), 260)
 
 int mblen(const char *s, size_t n);

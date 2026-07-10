@@ -29,6 +29,8 @@ int _fstat64(int fd, struct _stat64 *st);
 
 #define stat _stat64
 #define fstat _fstat64
+/* legacy CRT name: also route to the 64-bit variant */
+#define _stat _stat64
 
 #define _S_IFMT 0xF000
 #define _S_IFDIR 0x4000
