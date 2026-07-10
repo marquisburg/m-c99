@@ -82,6 +82,10 @@ static int is_ident_cont(int c) {
 
 static char *phase12(Arena *a, const char *src, size_t n, size_t *out_n) {
   char *buf = NULL;
+  /* Line splices delete a physical newline; re-emit the deleted newlines
+   * after the logical line ends so physical line numbering is preserved
+   * for diagnostics. */
+  int pending_nl = 0;
   for (size_t i = 0; i < n;) {
     /* trigraphs */
     if (i + 2 < n && src[i] == '?' && src[i + 1] == '?') {
@@ -107,10 +111,24 @@ static char *phase12(Arena *a, const char *src, size_t n, size_t *out_n) {
     if (src[i] == '\\' && i + 1 < n && (src[i + 1] == '\n' ||
         (src[i + 1] == '\r' && i + 2 < n && src[i + 2] == '\n'))) {
       i += (src[i + 1] == '\r') ? 3 : 2;
+      pending_nl++;
+      continue;
+    }
+    if (src[i] == '\n') {
+      buf_push(buf, '\n');
+      while (pending_nl > 0) {
+        buf_push(buf, '\n');
+        pending_nl--;
+      }
+      i++;
       continue;
     }
     buf_push(buf, src[i]);
     i++;
+  }
+  while (pending_nl > 0) {
+    buf_push(buf, '\n');
+    pending_nl--;
   }
   buf_push(buf, '\0');
   *out_n = buf_len(buf) - 1;
@@ -578,6 +596,21 @@ static char *expand_line(PP *pp, const char *path, int line, const char *in,
       while (i < n && is_ident_cont((unsigned char)in[i]))
         i++;
       char *id = arena_strndup(pp->arena, in + st, i - st);
+      /* dynamic predefined macros */
+      if (strcmp(id, "__FILE__") == 0) {
+        buf_push(out, '"');
+        for (const char *q = path ? path : "<pp>"; *q; q++)
+          buf_push(out, *q == '\\' ? '/' : *q);
+        buf_push(out, '"');
+        continue;
+      }
+      if (strcmp(id, "__LINE__") == 0) {
+        char tmp[16];
+        snprintf(tmp, sizeof(tmp), "%d", line);
+        for (const char *q = tmp; *q; q++)
+          buf_push(out, *q);
+        continue;
+      }
       Macro *m = macro_find(pp, id);
       if (!m) {
         for (const char *q = id; *q; q++)
@@ -738,6 +771,23 @@ static void install_predefs(PP *pp) {
    * Do NOT predefine bare `I` — it corrupts identifiers/comments (e.g. -I). */
 }
 
+/* Emit a GCC-style line marker: `# <line> "<file>"` — the lexer resyncs
+ * its reported location from these so diagnostics point at real source. */
+static void emit_line_marker(char **out, int line, const char *path) {
+  char tmp[32];
+  buf_push(*out, '#');
+  buf_push(*out, ' ');
+  snprintf(tmp, sizeof(tmp), "%d", line);
+  for (char *q = tmp; *q; q++)
+    buf_push(*out, *q);
+  buf_push(*out, ' ');
+  buf_push(*out, '"');
+  for (const char *q = path; *q; q++)
+    buf_push(*out, *q == '\\' ? '/' : *q);
+  buf_push(*out, '"');
+  buf_push(*out, '\n');
+}
+
 static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
                                size_t n0) {
   size_t n = 0;
@@ -754,6 +804,7 @@ static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
     }
   }
   buf_push(pp->include_stack, arena_strdup(pp->arena, path));
+  emit_line_marker(&out, 1, path);
 
   while (i < n) {
     size_t line_start = i;
@@ -948,16 +999,38 @@ static char *preprocess_buffer(PP *pp, const char *path, const char *src0,
                   buf_push(out, *q);
                 if (buf_len(out) == 0 || out[buf_len(out) - 1] != '\n')
                   buf_push(out, '\n');
+                /* resync to the line after the #include directive */
+                emit_line_marker(&out, line + 1, path);
+                i = next;
+                line++;
+                continue;
               }
             }
           }
         } else if (dir && strcmp(dir, "error") == 0) {
           pp_error(pp, path, line, "#error %s", rest);
         } else if (dir && strcmp(dir, "line") == 0) {
-          /* #line number ["file"] — accept and emit marker comment */
+          /* #line number ["file"] */
           char *exp = expand_line(pp, path, line, rest, 0);
-          buf_push(out, '\n');
-          (void)exp;
+          while (*exp == ' ' || *exp == '\t')
+            exp++;
+          long new_line = strtol(exp, &exp, 10);
+          while (*exp == ' ' || *exp == '\t')
+            exp++;
+          const char *new_file = path;
+          if (*exp == '"') {
+            exp++;
+            size_t e = 0;
+            while (exp[e] && exp[e] != '"')
+              e++;
+            new_file = arena_strndup(pp->arena, exp, e);
+          }
+          if (new_line > 0) {
+            emit_line_marker(&out, (int)new_line, new_file);
+            i = next;
+            line++;
+            continue;
+          }
         } else if (dir && strcmp(dir, "pragma") == 0) {
           /* ignore */
         } else if (dir) {

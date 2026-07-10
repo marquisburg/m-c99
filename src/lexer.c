@@ -95,8 +95,47 @@ static void skip_whitespace_and_comments(Lexer *L) {
       advance(L);
       continue;
     }
-    /* Residual directives after preprocess (e.g. unknown): skip line. */
+    /* Line marker from the preprocessor: `# <num> "file"` — resync the
+     * reported location. Other residual directives: skip the line. */
     if (c == '#') {
+      advance(L);
+      while (peek(L) == ' ' || peek(L) == '\t')
+        advance(L);
+      /* optional 'line' keyword */
+      if (peek(L) == 'l' && L->pos + 4 <= L->len &&
+          memcmp(L->src + L->pos, "line", 4) == 0) {
+        L->pos += 4;
+        L->col += 4;
+        while (peek(L) == ' ' || peek(L) == '\t')
+          advance(L);
+      }
+      if (peek(L) >= '0' && peek(L) <= '9') {
+        long num = 0;
+        while (peek(L) >= '0' && peek(L) <= '9')
+          num = num * 10 + (advance(L) - '0');
+        while (peek(L) == ' ' || peek(L) == '\t')
+          advance(L);
+        const char *fname = NULL;
+        if (peek(L) == '"') {
+          advance(L);
+          const char *fstart = L->src + L->pos;
+          while (!at_end(L) && peek(L) != '"' && peek(L) != '\n')
+            advance(L);
+          fname = arena_strndup(L->arena, fstart,
+                                (size_t)(L->src + L->pos - fstart));
+          if (peek(L) == '"')
+            advance(L);
+        }
+        while (!at_end(L) && peek(L) != '\n')
+          advance(L);
+        if (!at_end(L))
+          advance(L); /* consume newline; next line is `num` */
+        L->line = (int)num;
+        L->col = 1;
+        if (fname)
+          L->path = fname;
+        continue;
+      }
       while (!at_end(L) && peek(L) != '\n')
         advance(L);
       continue;
