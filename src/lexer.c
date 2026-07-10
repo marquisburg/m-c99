@@ -372,7 +372,8 @@ static Token lex_number(Lexer *L) {
   } else {
     while (peek(L) >= '0' && peek(L) <= '9')
       advance(L);
-    if (peek(L) == '.' && (peek2(L) >= '0' && peek2(L) <= '9')) {
+    if (peek(L) == '.') {
+      /* C99 6.4.4.2: "1." and "1.f" are valid floating constants */
       is_float = 1;
       advance(L);
       while (peek(L) >= '0' && peek(L) <= '9')
