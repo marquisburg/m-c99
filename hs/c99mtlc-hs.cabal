@@ -1,0 +1,47 @@
+cabal-version:      2.4
+name:               c99mtlc-hs
+version:            0.1.0
+synopsis:           C99 frontend for libmtlc, in Haskell
+description:
+  A C99 compiler frontend that lowers to libmtlc (native IR, optimizer,
+  x86-64 PE). A port of the C frontend in src/; the two build side by side.
+
+build-type:         Simple
+
+-- Boot libraries only: there is no package index to resolve anything else
+-- against, and `ghc --make` (see build_hs.bat) must work without cabal.
+library
+    hs-source-dirs:   src
+    exposed-modules:
+        C99.Ast
+        C99.Common
+        C99.CType
+        C99.Lexer
+        C99.Lower
+        C99.Parser
+        C99.Preprocess
+        C99.Runtime
+        C99.Sema
+        C99.StaticRename
+        C99.Token
+        Mtlc
+        Mtlc.FFI
+    build-depends:
+        base        >= 4.14 && < 5,
+        bytestring,
+        containers,
+        directory,
+        filepath,
+        mtl
+    c-sources:        cbits/blob.c
+    include-dirs:     ../libmtlc/include
+    extra-libraries:  dbghelp
+    ghc-options:      -Wall -O2
+    default-language: Haskell2010
+
+executable c99mtlc-hs
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    build-depends:    base, c99mtlc-hs
+    ghc-options:      -Wall -O2
+    default-language: Haskell2010

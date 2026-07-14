@@ -8,8 +8,12 @@ $Scratch = $args[0]
 if (-not $Scratch) {
   $Scratch = Join-Path $env:TEMP "c99mtlc-suite"
 }
-$CC = Join-Path $Root "bin\c99mtlc.exe"
+# Which frontend to exercise. Defaults to the C one; set C99MTLC to point at
+# another (e.g. bin\c99mtlc-hs.exe, the Haskell frontend).
+$CC = $env:C99MTLC
+if (-not $CC) { $CC = Join-Path $Root "bin\c99mtlc.exe" }
 if (-not (Test-Path $CC)) { Write-Error "missing $CC"; exit 1 }
+Write-Host "Using compiler: $CC"
 
 function Run-Case($Name, $ArgsList, $ExpectExit, $ExpectOutContains) {
   $dir = Join-Path $Scratch $Name

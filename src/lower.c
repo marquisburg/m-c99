@@ -367,75 +367,64 @@ static MtlcValue float_bits_as_i64(Lower *L, MtlcValue v, const MtlcType *fty) {
   return mtlc_load(L->fn, ip, i64);
 }
 
-/* Zero `n` bytes at addr (C99 aggregate default zero). Unrolled for small n. */
-static void mem_zero(Lower *L, MtlcValue addr, size_t n) {
-  const MtlcType *i8 = mtlc_type_scalar(MTLC_TYPE_UINT8);
+/* Address `base + off` reinterpreted as a pointer to `ct`. */
+static MtlcValue chunk_addr(Lower *L, MtlcValue base, size_t off,
+                            const MtlcType *ct) {
   const MtlcType *u64 = mtlc_type_scalar(MTLC_TYPE_UINT64);
-  const MtlcType *i8p = i8p_ty();
-  MtlcValue z = mtlc_const_int(L->fn, i8, 0);
-  if (n <= 64) {
-    for (size_t i = 0; i < n; i++) {
-      MtlcValue off = mtlc_const_int(L->fn, u64, (long long)i);
-      MtlcValue a = mtlc_binary(L->fn, "+", addr, off, i8p);
-      mtlc_store(L->fn, a, z, i8);
-    }
-    return;
+  MtlcValue a = base;
+  if (off) {
+    MtlcValue o = mtlc_const_int(L->fn, u64, (long long)off);
+    a = mtlc_binary(L->fn, "+", base, o, i8p_ty());
   }
-  /* IR loop for larger objects */
-  MtlcValue i = mtlc_local(L->fn, fresh_tmp(L, "zi"), u64);
-  mtlc_assign(L->fn, i, mtlc_const_int(L->fn, u64, 0));
-  char *top = fresh_label(L, "ztop");
-  char *body = fresh_label(L, "zbody");
-  char *end = fresh_label(L, "zend");
-  mtlc_label(L->fn, top);
-  MtlcValue lim = mtlc_const_int(L->fn, u64, (long long)n);
-  MtlcValue cmp = mtlc_binary(L->fn, "<", i, lim, mtlc_type_scalar(MTLC_TYPE_INT32));
-  mtlc_branch_if_zero(L->fn, cmp, end);
-  mtlc_label(L->fn, body);
-  {
-    MtlcValue a = mtlc_binary(L->fn, "+", addr, i, i8p);
-    mtlc_store(L->fn, a, z, i8);
-    MtlcValue one = mtlc_const_int(L->fn, u64, 1);
-    mtlc_assign(L->fn, i, mtlc_binary(L->fn, "+", i, one, u64));
-    mtlc_jump(L->fn, top);
-  }
-  mtlc_label(L->fn, end);
+  return mtlc_cast(L->fn, a, mtlc_type_pointer(ct));
 }
 
-/* Copy `n` bytes from src to dst. */
-static void mem_copy(Lower *L, MtlcValue dst, MtlcValue src, size_t n) {
-  const MtlcType *i8 = mtlc_type_scalar(MTLC_TYPE_UINT8);
-  const MtlcType *u64 = mtlc_type_scalar(MTLC_TYPE_UINT64);
-  const MtlcType *i8p = i8p_ty();
-  if (n <= 64) {
-    for (size_t i = 0; i < n; i++) {
-      MtlcValue off = mtlc_const_int(L->fn, u64, (long long)i);
-      MtlcValue sa = mtlc_binary(L->fn, "+", src, off, i8p);
-      MtlcValue da = mtlc_binary(L->fn, "+", dst, off, i8p);
-      MtlcValue b = mtlc_load(L->fn, sa, i8);
-      mtlc_store(L->fn, da, b, i8);
-    }
+/* Widest scalar chunk that fits in `rem` bytes; sets *step. */
+static const MtlcType *chunk_type(size_t rem, size_t *step) {
+  if (rem >= 8) { *step = 8; return mtlc_type_scalar(MTLC_TYPE_UINT64); }
+  if (rem >= 4) { *step = 4; return mtlc_type_scalar(MTLC_TYPE_UINT32); }
+  if (rem >= 2) { *step = 2; return mtlc_type_scalar(MTLC_TYPE_UINT16); }
+  *step = 1;
+  return mtlc_type_scalar(MTLC_TYPE_UINT8);
+}
+
+/* Zero `n` bytes at addr (C99 aggregate default zero). Wide chunks for
+ * small n, extern memset beyond. */
+static void mem_zero(Lower *L, MtlcValue addr, size_t n) {
+  if (n > 64) {
+    const MtlcType *u64 = mtlc_type_scalar(MTLC_TYPE_UINT64);
+    const MtlcType *i32 = mtlc_type_scalar(MTLC_TYPE_INT32);
+    MtlcValue args[3] = {addr, mtlc_const_int(L->fn, i32, 0),
+                         mtlc_const_int(L->fn, u64, (long long)n)};
+    mtlc_call(L->fn, "memset", args, 3, i8p_ty());
     return;
   }
-  MtlcValue i = mtlc_local(L->fn, fresh_tmp(L, "ci"), u64);
-  mtlc_assign(L->fn, i, mtlc_const_int(L->fn, u64, 0));
-  char *top = fresh_label(L, "ctop");
-  char *body = fresh_label(L, "cbody");
-  char *end = fresh_label(L, "cend");
-  mtlc_label(L->fn, top);
-  MtlcValue lim = mtlc_const_int(L->fn, u64, (long long)n);
-  MtlcValue cmp = mtlc_binary(L->fn, "<", i, lim, mtlc_type_scalar(MTLC_TYPE_INT32));
-  mtlc_branch_if_zero(L->fn, cmp, end);
-  mtlc_label(L->fn, body);
-  {
-    MtlcValue sa = mtlc_binary(L->fn, "+", src, i, i8p);
-    MtlcValue da = mtlc_binary(L->fn, "+", dst, i, i8p);
-    mtlc_store(L->fn, da, mtlc_load(L->fn, sa, i8), i8);
-    mtlc_assign(L->fn, i,
-                mtlc_binary(L->fn, "+", i, mtlc_const_int(L->fn, u64, 1), u64));
-    mtlc_jump(L->fn, top);
+  for (size_t off = 0; off < n;) {
+    size_t step;
+    const MtlcType *ct = chunk_type(n - off, &step);
+    mtlc_store(L->fn, chunk_addr(L, addr, off, ct),
+               mtlc_const_int(L->fn, ct, 0), ct);
+    off += step;
   }
-  mtlc_label(L->fn, end);
+}
+
+/* Copy `n` bytes from src to dst. Wide chunks for small n, extern memcpy
+ * beyond. */
+static void mem_copy(Lower *L, MtlcValue dst, MtlcValue src, size_t n) {
+  if (n > 64) {
+    const MtlcType *u64 = mtlc_type_scalar(MTLC_TYPE_UINT64);
+    MtlcValue args[3] = {dst, src, mtlc_const_int(L->fn, u64, (long long)n)};
+    mtlc_call(L->fn, "memcpy", args, 3, i8p_ty());
+    return;
+  }
+  for (size_t off = 0; off < n;) {
+    size_t step;
+    const MtlcType *ct = chunk_type(n - off, &step);
+    MtlcValue sa = chunk_addr(L, src, off, ct);
+    MtlcValue da = chunk_addr(L, dst, off, ct);
+    mtlc_store(L->fn, da, mtlc_load(L->fn, sa, ct), ct);
+    off += step;
+  }
 }
 
 static const char *sym_link(Symbol *sym) {
@@ -447,7 +436,6 @@ static const char *sym_link(Symbol *sym) {
 /* Ensure file-scope object-pointer global is allocated and zeroed.
  * Used for aggregates and for scalar globals that have their address taken. */
 static MtlcValue ensure_agg_global(Lower *L, const char *name, size_t bytes) {
-  const MtlcType *i8p = i8p_ty();
   MtlcValue g = mtlc_global_ref(L->fn, name);
   char *done = fresh_label(L, "gdone");
   char *need = fresh_label(L, "ginit");
@@ -1759,6 +1747,12 @@ static void declare_runtime(MtlcBuilder *b) {
   const char *pe1[] = {"code"};
   const MtlcType *pet1[] = {i32};
   mtlc_builder_function(b, "exit", v, pe1, pet1, 1, 1);
+  const char *pm3[] = {"dst", "src", "n"};
+  const MtlcType *pmt3[] = {pvoid, pvoid, u64};
+  mtlc_builder_function(b, "memcpy", pvoid, pm3, pmt3, 3, 1);
+  const char *ps3[] = {"dst", "c", "n"};
+  const MtlcType *pst3[] = {pvoid, i32, u64};
+  mtlc_builder_function(b, "memset", pvoid, ps3, pst3, 3, 1);
 }
 
 static void gen_function(Lower *L, Node *fn) {
