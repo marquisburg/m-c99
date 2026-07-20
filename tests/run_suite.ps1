@@ -53,6 +53,7 @@ Need (Run-Case "regression/loop" @("tests\loop.c") 55 $null)
 
 Need (Run-Case "gaps/pp_include" @("-I","tests\include","tests\pp_include.c") 42 $null)
 Need (Run-Case "gaps/pp_macros" @("tests\pp_macros.c") 22 $null)
+Need (Run-Case "gaps/pp_cond" @("tests\pp_cond.c") 42 $null)
 Need (Run-Case "gaps/designated" @("tests\designated.c") 24 $null)
 Need (Run-Case "gaps/switch_ft" @("tests\switch_ft.c") 11 $null)
 Need (Run-Case "gaps/fptr" @("tests\fptr.c") 42 $null)

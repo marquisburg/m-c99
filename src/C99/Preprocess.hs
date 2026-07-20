@@ -154,8 +154,8 @@ physLines = lines
 
 -- ---- #if expression evaluation ----
 
--- Identifiers that are not object-like macros with a numeric body evaluate to
--- 0; there is no full rescanning expansion here.
+-- Operands reach here already macro-expanded (see 'ifCondition'), so an
+-- identifier still standing is one C99 6.10.1p4 makes 0.
 
 type E = (Int64, String)
 
@@ -351,6 +351,24 @@ scanLit _ ['\\'] = ("\\", [])
 scanLit q (c : r)
   | c == q = ([c], r)
   | otherwise = let (a, r') = scanLit q r in (c : a, r')
+
+-- | Phase 3: each comment becomes one space.
+--
+-- Ordinary text keeps its comments, because the lexer strips them and @-E@
+-- output reads better with them. But a directive captures raw text that no
+-- lexer ever sees: a @#define@ body would carry @// count@ into every
+-- expansion and comment out the rest of the line, and a @#if@ operand would
+-- feed @/* why */@ to the expression parser, which reads the @/@ as division.
+stripComments :: String -> String
+stripComments = go
+  where
+    go [] = []
+    -- a line comment runs to the end of the logical line
+    go ('/' : '/' : _) = " "
+    go ('/' : '*' : r) = ' ' : go (snd (scanBlockComment r))
+    go (q : r)
+      | q == '"' || q == '\'' = let (lit, r') = scanLit q r in q : lit ++ go r'
+    go (c : r) = c : go r
 
 -- | Consume a block comment body, including the closing @*/@. Fewer than two
 -- characters left means the comment is unterminated and the tail is left alone.
@@ -679,6 +697,46 @@ mergeLines depth inC logical ls merged
 
 -- ---- directives ----
 
+-- | Evaluate a @#if@ / @#elif@ condition.
+--
+-- C99 6.10.1p4 orders this: strip comments, resolve @defined X@ (whose operand
+-- must survive expansion), macro-expand what is left, then evaluate. Skipping
+-- the expansion step made @#define VER (1 << 8)@ followed by @#if VER > 100@
+-- take the false branch, because a body that is not a bare integer read as 0.
+ifCondition :: Table -> FilePath -> Int -> String -> Bool
+ifCondition tbl path line rest =
+  evalExpr tbl (expandLine tbl path line (resolveDefined tbl (stripComments rest)) False) /= 0
+
+-- | Replace each @defined X@ and @defined(X)@ with @1@ or @0@ before expansion
+-- reaches it, so a macro that is defined as something numeric does not get
+-- substituted into its own @defined@ test.
+resolveDefined :: Table -> String -> String
+resolveDefined tbl = go
+  where
+    go [] = []
+    go (q : r)
+      | q == '"' || q == '\'' = let (lit, r') = scanLit q r in q : lit ++ go r'
+    go s@(c : r)
+      | isIdentStart c =
+          let (i, r') = span isIdentCont s
+           in if i == "defined" then defOp r' else i ++ go r'
+      | otherwise = c : go r
+
+    defOp r0 =
+      let (paren, r1) = case dropWhile isSpaceTab r0 of
+            ('(' : r) -> (True, dropWhile isSpaceTab r)
+            r -> (False, r)
+          (mid, r2) = readIdent r1
+          r3
+            | paren = case dropWhile isSpaceTab r2 of
+                (')' : r) -> r
+                r -> r
+            | otherwise = r2
+          found = case mid of
+            Just i -> maybe False (const True) (macroFind tbl i)
+            Nothing -> False
+       in (if found then "1" else "0") ++ go r3
+
 directive :: FilePath -> String -> Int -> [String] -> PPM [String]
 directive path raw line acc = do
   let afterHash = dropWhile isSpaceTab (drop 1 (dropWhile isSpaceTab raw))
@@ -709,7 +767,7 @@ directive path raw line acc = do
         (t : ts) -> do
           let t'
                 | t == 1 = 2
-                | t == 0 = if evalExpr tbl rest /= 0 then 1 else 0
+                | t == 0 = if ifCondition tbl path line rest then 1 else 0
                 | otherwise = t
           modify $ \s -> s {stIfStack = t' : ts}
           recompute
@@ -718,7 +776,7 @@ directive path raw line acc = do
       tbl <- gets stMacros
       dis <- gets stDisabled
       let take_
-            | d == "if" = evalExpr tbl rest /= 0
+            | d == "if" = ifCondition tbl path line rest
             | otherwise =
                 let def = case fst (readIdent rest) of
                       Just n -> maybe False (const True) (macroFind tbl n)
@@ -755,7 +813,7 @@ directive path raw line acc = do
       | otherwise = t
 
 doDefine :: FilePath -> Int -> String -> PPM ()
-doDefine path line rest = case readIdent rest of
+doDefine path line rest0 = case readIdent rest of
   (Nothing, _) -> ppError path line "#define missing name"
   (Just name, afterName) -> do
     let (isFn, variadic, params, afterParams) = case afterName of
@@ -775,6 +833,9 @@ doDefine path line rest = case readIdent rest of
             }
     modify $ \s -> s {stMacros = macroDefine m (stMacros s)}
   where
+    -- before the name, so a comment between the parameters goes too
+    rest = stripComments rest0
+
     trimEnd = reverse . dropWhile isSpaceTab . reverse
 
     parseParams s0
