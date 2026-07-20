@@ -71,15 +71,44 @@ list with `--help-warnings`.
 | Group | Fires on |
 |---|---|
 | `unused` | a block-scope variable nothing reads |
+| `unreachable-code` | a statement control can never arrive at |
+| `missing-return` | a value-returning function that can run off its end |
 
 `-Werror` turns every warning that is still on into an error, and the build
 fails. `-w` silences all of them.
 
-The false-positive budget for a warning is zero. `unused` therefore says
-nothing about a parameter (an unused one is often required by a signature),
-nothing about anything `extern`, `static` or global (another unit may read it),
-and nothing about a name starting with `_`, which is how you say "declared on
-purpose, not used". The suggested fix names the exact rename:
+A group exists only when the check behind it exists. A flag that silences
+nothing is worse than a missing flag, because it tells you the compiler checks
+something it does not.
+
+## The false-positive budget is zero
+
+This is the rule that decides what each warning does *not* say, and it is worth
+stating plainly: a warning nobody trusts is worse than no warning, because it
+trains people to pass `-w`.
+
+`unused` therefore says nothing about a parameter (an unused one is often
+required by a signature), nothing about anything `extern`, `static` or global
+(another unit may read it), and nothing about a name starting with `_`, which
+is how you say "declared on purpose, not used".
+
+`missing-return` asks whether control can fall off the end, and every case it
+is unsure about answers "no". It understands that a `switch` covering every
+path with a `default` cannot fall out, that `for (;;)` with no `break` never
+finishes, that both arms of an `if`/`else` returning is enough, and that a call
+to `exit`, `abort` or `ExitProcess` does not come back. `main` is exempt, since
+C99 6.5.2.2p5 defines falling off the end of `main` as `return 0`.
+
+That list is not academic. Before the `switch` and noreturn cases were handled,
+`missing-return` produced **118 warnings on the 112-file Mettle codebase, every
+one of them wrong**. It now produces none there, and the shapes that caused
+them are the `ok_*` functions in `tests/diag/flow.c`.
+
+`unreachable-code` reports only the *first* dead statement in a run, because
+listing every one turns a single mistake into a wall of output, and it stops at
+a label, since a `goto` can land there.
+
+The suggested fix names the exact rename:
 
 ```
 warning: unused variable 'scratch'
@@ -175,11 +204,27 @@ Need (Run-Diag "diag/undeclared" @("tests\diag\undeclared.c") $false `
 Asserting the caret run literally pins the column, the length and the label in
 one pattern.
 
-The last argument is what must *not* appear, and it is the only way to test
-that something reports once rather than five times:
+The last argument is what must *not* appear, and it is where the real work
+happens. Two examples.
+
+Testing that one mistake reports once needs a second, unrelated mistake in the
+same file. Asserting only "one error" would pass just as well if the parser
+gave up at the first one and never read the rest, which is the opposite of
+recovering:
 
 ```powershell
 Need (Run-Diag "diag/cascade" @("tests\diag\cascade.c") $false `
-  @("due to 1 previous error") `
-  @("expected a declaration", "due to [2-9] previous"))
+  @("--> .*cascade\.c:17:", "--> .*cascade\.c:21:", "due to 2 previous errors") `
+  @("expected a declaration", "due to [3-9] previous"))
+```
+
+Testing a warning needs the shapes that must stay *quiet* more than the one
+that fires. Every `ok_*` function in `tests/diag/flow.c` is a shape that once
+warned falsely:
+
+```powershell
+Need (Run-Diag "diag/flow" @("tests\diag\flow.c") $true `
+  @("warning: unreachable statement", "control can reach here without returning a value") `
+  @("ok_switch_all_return", "ok_if_else", "ok_forever", "ok_noreturn_tail",
+    "ok_void", "ok_label_after_return", "'main'"))
 ```

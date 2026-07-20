@@ -119,11 +119,18 @@ Need (Run-Diag "diag/undeclared" @("tests\diag\undeclared.c") $false `
     "= help: did you mean 'counter'\?",
     "--> .*undeclared\.c:6:12") $null)
 
-# One mistake, one diagnostic. Before recovery this reported three.
+# One diagnostic per real mistake, and no more. The file holds two unrelated
+# problems: a missing ';' on line 14 and an undeclared name on line 21.
+#
+# The second one is the load-bearing half. Asserting only "one error" would
+# also pass if the parser gave up at the first mistake and never read the rest
+# of the file, which is the opposite of recovering. Requiring both proves it
+# recovered; requiring exactly two proves it did not cascade.
 Need (Run-Diag "diag/cascade" @("tests\diag\cascade.c") $false `
-  @("error\[E0010\]: expected ;",
-    "due to 1 previous error") `
-  @("expected a declaration", "due to [2-9] previous"))
+  @("--> .*cascade\.c:17:",
+    "--> .*cascade\.c:21:",
+    "due to 2 previous errors") `
+  @("expected a declaration", "due to [3-9] previous"))
 
 Need (Run-Diag "diag/unused" @("tests\diag\unused.c") $true `
   @("warning: unused variable 'scratch'",
@@ -136,6 +143,21 @@ Need (Run-Diag "diag/unused_off" @("-Wno-unused", "tests\diag\unused.c") $true `
   $null @("unused variable"))
 Need (Run-Diag "diag/unused_werror" @("-Werror", "tests\diag\unused.c") $false `
   @("unused variable 'scratch'", "due to 1 previous error") $null)
+
+# Flow warnings. The MustNotMatch list is the real test: every ok_* function in
+# flow.c is a shape that must stay quiet, and they are the shapes that produced
+# 118 false positives on the Mettle sources before switch and noreturn were
+# handled.
+Need (Run-Diag "diag/flow" @("tests\diag\flow.c") $true `
+  @("warning: unreachable statement",
+    "this will never run",
+    "non-void function 'no_return_on_one_path' can end without returning",
+    "control can reach here without returning a value") `
+  @("ok_switch_all_return", "ok_if_else", "ok_forever", "ok_noreturn_tail",
+    "ok_void", "ok_label_after_return", "'main'"))
+
+Need (Run-Diag "diag/flow_off" @("-Wno-unreachable-code", "-Wno-missing-return", "tests\diag\flow.c") $true `
+  $null @("unreachable statement", "can end without returning"))
 
 Need (Run-Diag "diag/redefinition" @("tests\diag\redefinition.c") $false `
   @("error\[E0100\]: redefinition of 'x'",

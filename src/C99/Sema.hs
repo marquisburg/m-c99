@@ -101,6 +101,203 @@ emit m = modify' $ \s -> s {ssMsgs = m : ssMsgs s}
 visibleNames :: Sema [String]
 visibleNames = gets (concatMap M.keys . ssScopes)
 
+-- ---- flow warnings ----
+
+-- | Whether control can leave this statement by falling off its end.
+--
+-- Everything unsure answers 'False' (\"cannot fall through\"), because both
+-- callers only warn when this says 'True'. A wrong 'True' is a false positive;
+-- a wrong 'False' just costs a warning nobody gets. @goto@ and @switch@ are
+-- the interesting cases: this does not follow a jump, and a switch without a
+-- @default@ can fall through but proving it is not worth the risk.
+fallsThrough :: Stmt -> Bool
+fallsThrough s = case stNode s of
+  SReturn _ -> False
+  SGoto _ -> False
+  SBreak -> False
+  SContinue -> False
+  SExpr e | isNoReturnCall e -> False
+  SCompound items -> all fallsThroughItem items
+  SIf _ a (Just b) -> fallsThrough a || fallsThrough b
+  -- a one-armed if is skipped when the condition is false
+  SIf _ _ Nothing -> True
+  -- while (1) / for (;;) with nothing to break out of it never finishes
+  SWhile c b -> not (isAlwaysTrue c && not (hasBreak b))
+  -- SFor is (init, condition, increment, body)
+  SFor _ c _ b -> not (forever c && not (hasBreak b))
+    where
+      forever Nothing = True
+      forever (Just e) = isAlwaysTrue e
+  SDo b c -> fallsThrough b && not (isAlwaysTrue c && not (hasBreak b))
+  SLabel _ b -> fallsThrough b
+  SCase _ b -> fallsThrough b
+  SDefault b -> fallsThrough b
+  SSwitch _ b -> switchFallsThrough b
+  _ -> True
+  where
+    fallsThroughItem (BIStmt x) = fallsThrough x
+    fallsThroughItem (BIDecl _) = True
+
+-- | A switch completes normally when any of three things is true: no
+-- @default@ (so an unmatched value skips the whole statement), a @break@ that
+-- belongs to it, or a last group that runs off the end.
+--
+-- Without this, every function ending in a fully-returning @switch@ with a
+-- @default@ looked like it could fall out. That is the commonest shape in a
+-- compiler, and it produced 118 false positives on the Mettle sources against
+-- 0 real ones.
+switchFallsThrough :: Stmt -> Bool
+switchFallsThrough body =
+  not (hasDefault body) || hasBreak body || lastGroupFallsThrough body
+  where
+    lastGroupFallsThrough s = case stNode s of
+      SCompound items -> case reverse items of
+        (BIStmt x : _) -> fallsThrough x
+        (BIDecl _ : _) -> True
+        [] -> True
+      _ -> fallsThrough s
+
+-- | Does this switch body have a @default@ of its own? A @default@ inside a
+-- nested switch belongs to that one.
+hasDefault :: Stmt -> Bool
+hasDefault s = case stNode s of
+  SDefault _ -> True
+  SSwitch {} -> False
+  SCompound items -> any item items
+  SIf _ a mb -> hasDefault a || maybe False hasDefault mb
+  SLabel _ b -> hasDefault b
+  SCase _ b -> hasDefault b
+  SWhile _ b -> hasDefault b
+  SDo b _ -> hasDefault b
+  SFor _ _ _ b -> hasDefault b
+  _ -> False
+  where
+    item (BIStmt x) = hasDefault x
+    item (BIDecl _) = False
+
+-- | A @break@ that belongs to *this* loop: one nested inside an inner loop or
+-- a switch binds there instead, so it does not keep this loop alive.
+hasBreak :: Stmt -> Bool
+hasBreak s = case stNode s of
+  SBreak -> True
+  SWhile {} -> False
+  SDo {} -> False
+  SFor {} -> False
+  SSwitch {} -> False
+  SCompound items -> any item items
+  SIf _ a mb -> hasBreak a || maybe False hasBreak mb
+  SLabel _ b -> hasBreak b
+  SCase _ b -> hasBreak b
+  SDefault b -> hasBreak b
+  _ -> False
+  where
+    item (BIStmt x) = hasBreak x
+    item (BIDecl _) = False
+
+isAlwaysTrue :: Expr -> Bool
+isAlwaysTrue e = case foldConst e of
+  Just n -> n /= 0
+  Nothing -> False
+
+-- | A call that never comes back, so the statements after it are not reached.
+--
+-- There is no @_Noreturn@ or @__attribute__((noreturn))@ in the type system
+-- yet, so this is a name list. It only has to cover the functions people
+-- actually end a function with; anything missing costs a false warning, which
+-- is why 'ExitProcess' is here (it was the last false positive across the
+-- 112-file Mettle build).
+isNoReturnCall :: Expr -> Bool
+isNoReturnCall e = case exNode e of
+  ECall f _ _ -> case exNode f of
+    EIdent n _ -> baseName n `elem` noReturnNames
+    _ -> False
+  _ -> False
+  where
+    noReturnNames =
+      [ "exit"
+      , "_exit"
+      , "_Exit"
+      , "abort"
+      , "longjmp"
+      , "ExitProcess"
+      , "ExitThread"
+      , "TerminateProcess"
+      , "__builtin_unreachable"
+      , "__builtin_trap"
+      ]
+
+-- | Undo the file-scope static mangling for display.
+--
+-- 'C99.StaticRename' rewrites a static to @__\<prefix\>\<tu\>_\<name\>@ before sema
+-- runs, so a diagnostic that names a function would otherwise print
+-- @__st35_helper@ at someone who wrote @helper@.
+baseName :: String -> String
+baseName n = case n of
+  ('_' : '_' : rest) -> case break (== '_') rest of
+    (tag, '_' : real)
+      | not (null tag)
+      , not (null real)
+      , any (`elem` ['0' .. '9']) tag ->
+          real
+    _ -> n
+  _ -> n
+
+-- | Warn on the first statement after one that cannot fall through.
+--
+-- Only the first, and only in a straight run of statements: reporting every
+-- dead statement in a block turns one mistake into a wall of output. A label
+-- ends the run, because a @goto@ can land on it.
+warnUnreachable :: [BlockItem] -> Sema ()
+warnUnreachable items = go items
+  where
+    go (BIStmt a : rest@(next : _))
+      | not (fallsThrough a)
+      , Just loc <- itemLoc next
+      , not (isLabelled next) =
+          emit
+            . withLabel "this will never run"
+            . withHelp "remove it, or move it above the statement that exits"
+            $ (diag Warning loc "unreachable statement")
+              {msgGroup = Just WUnreachable}
+      | otherwise = go rest
+    go (_ : rest) = go rest
+    go [] = pure ()
+
+    itemLoc (BIStmt x) = Just (stLoc x)
+    itemLoc (BIDecl (d : _)) = Just (dLoc d)
+    itemLoc (BIDecl []) = Nothing
+
+    -- a goto can jump here, so it is not dead
+    isLabelled (BIStmt x) = case stNode x of
+      SLabel {} -> True
+      SCase {} -> True
+      SDefault {} -> True
+      _ -> False
+    isLabelled _ = False
+
+-- | Warn when a value-returning function can run off its end.
+--
+-- C99 6.9.1p12 makes the caller's use of that value undefined, and it is
+-- nearly always a missing @return@ on one branch rather than a deliberate
+-- choice. @main@ is exempt: 6.5.2.2p5 defines falling off the end of @main@ as
+-- @return 0@.
+warnMissingReturn :: FuncDef -> Stmt -> Sema ()
+warnMissingReturn fd body
+  | baseName (fdName fd) == "main" = pure ()
+  | ret <- funcRet (fdType fd)
+  , ret /= TVoid
+  , fallsThrough body =
+      let shown = baseName (fdName fd)
+       in
+      emit
+        . withLabel "control can reach here without returning a value"
+        . withHelp ("add a return, or make '" ++ shown ++ "' return void")
+        . withSnap shown
+        . withLen (length shown)
+        $ (diag Warning (fdLoc fd) ("non-void function '" ++ shown ++ "' can end without returning a value"))
+          {msgGroup = Just WMissingReturn}
+  | otherwise = pure ()
+
 -- ---- scopes and symbols ----
 
 pushScope :: Sema ()
@@ -698,6 +895,7 @@ checkStmt st = case stNode st of
   SExpr x -> node . SExpr <$> checkExpr x
   SCompound items -> do
     pushScope
+    warnUnreachable items
     items' <- mapM checkBlockItem items
     popScopeChecked
     pure (node (SCompound items'))
@@ -941,6 +1139,7 @@ checkPass td = case td of
           sid <- insertSym SymVar (pName p) pt (fdLoc fd) False
           pure p {pType = pt, pSym = Just sid}
     body <- checkStmt (fdBody fd)
+    warnMissingReturn fd body
     modify' (\s -> s {ssRetTy = Nothing})
     popScope
     pure (TDFunc fd {fdParams = params, fdBody = body})

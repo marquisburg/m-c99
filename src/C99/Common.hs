@@ -24,6 +24,7 @@ module C99.Common
   , note
   , WarnGroup (..)
   , warnGroupName
+  , warnGroupBlurb
   , allWarnGroups
   , formatMessage
   , hasErrors
@@ -48,12 +49,12 @@ data Severity = Error | Warning | Note
 
 -- | Warnings are grouped so @-Wno-unused@ and friends can switch them off. A
 -- diagnostic with no group cannot be disabled.
+--
+-- Only groups that actually fire belong here. A flag that silences nothing is
+-- worse than a missing flag: it tells someone the compiler checks something it
+-- does not. Add the constructor in the same change as the check.
 data WarnGroup
   = WUnused
-  | WImplicitConversion
-  | WSignCompare
-  | WUninitialized
-  | WShadow
   | WUnreachable
   | WMissingReturn
   deriving (Eq, Ord, Show, Enum, Bounded)
@@ -61,12 +62,15 @@ data WarnGroup
 warnGroupName :: WarnGroup -> String
 warnGroupName g = case g of
   WUnused -> "unused"
-  WImplicitConversion -> "implicit-conversion"
-  WSignCompare -> "sign-compare"
-  WUninitialized -> "uninitialized"
-  WShadow -> "shadow"
   WUnreachable -> "unreachable-code"
   WMissingReturn -> "missing-return"
+
+-- | One line each for @--help-warnings@.
+warnGroupBlurb :: WarnGroup -> String
+warnGroupBlurb g = case g of
+  WUnused -> "a block-scope variable nothing reads"
+  WUnreachable -> "a statement control can never arrive at"
+  WMissingReturn -> "a value-returning function that can run off its end"
 
 allWarnGroups :: [WarnGroup]
 allWarnGroups = [minBound .. maxBound]

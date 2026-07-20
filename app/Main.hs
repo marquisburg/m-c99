@@ -98,7 +98,14 @@ warningsHelp =
     ( [ "Warning groups. Each is on by default and off with -Wno-<group>."
       , ""
       ]
-        ++ map (\g -> "  -Wno-" ++ warnGroupName g) allWarnGroups
+        ++ map
+          ( \g ->
+              "  -Wno-"
+                ++ warnGroupName g
+                ++ replicate (max 1 (22 - length (warnGroupName g))) ' '
+                ++ warnGroupBlurb g
+          )
+          allWarnGroups
         ++ [ ""
            , "  -Werror   turn every warning that is still on into an error"
            ]
