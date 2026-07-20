@@ -160,8 +160,22 @@ One mistake should report once. Three things enforce that:
 - **Duplicates are dropped** and diagnostics are sorted by position before
   printing, so the order matches the file rather than the pass that ran.
 
-Every input file is parsed even when an earlier one failed, so one run tells
-you the state of the whole build.
+Every input file is parsed even when an earlier one failed, and the type
+checker runs on whatever parsed, so a missing semicolon in one function and a
+type error in another come out of the same run rather than one build apiece.
+
+That has one honest cost. A declaration the parser could not read is one the
+checker never saw, so a later use of that name is reported as undeclared even
+though you wrote the declaration. The syntax errors print first, so the order
+to fix things in is on screen, but a run with parse errors in it can contain
+knock-on errors that go away on their own. Suppressing the whole class was the
+alternative, and it would have thrown away the ordinary case (which is the
+common one) to tidy up the pathological one.
+
+Sema *warnings* are dropped when the parse failed, for the same reason in
+reverse: a warning is advice about code you mean to keep, and on a file that
+does not parse it is as likely to be an artefact of the lost tree as a real
+finding. Nobody acts on warnings in a build that already failed.
 
 Printing stops after 100 errors and says so. `--max-errors=N` changes the
 limit; `--max-errors=0` removes it.

@@ -144,6 +144,15 @@ Need (Run-Diag "diag/unused_off" @("-Wno-unused", "tests\diag\unused.c") $true `
 Need (Run-Diag "diag/unused_werror" @("-Werror", "tests\diag\unused.c") $false `
   @("unused variable 'scratch'", "due to 1 previous error") $null)
 
+# A syntax error no longer hides the semantic errors behind it: both come out
+# of one run. The must-not-match half pins the other side of the rule, that
+# sema warnings are dropped when the parse failed.
+Need (Run-Diag "diag/phases" @("tests\diag\phases.c") $false `
+  @("error\[E0010\]: expected ;",
+    "error\[E0102\]: undeclared identifier 'undeclared_thing'",
+    "due to 2 previous errors") `
+  @("unused variable", "due to [3-9] previous"))
+
 # Flow warnings. The MustNotMatch list is the real test: every ok_* function in
 # flow.c is a shape that must stay quiet, and they are the shapes that produced
 # 118 false positives on the Mettle sources before switch and noreturn were

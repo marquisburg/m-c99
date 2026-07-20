@@ -161,11 +161,30 @@ synchronize = go (0 :: Int)
           | k == TkRParen -> advance >> go (max 0 (depth - 1))
           | otherwise -> advance >> go depth
 
+    -- The type keywords matter as much as the storage ones: without them,
+    -- recovery walks straight past the next `int foo(void)` and the caller
+    -- reports "expected a declaration" once per function to the end of the
+    -- file. Anything that can begin a declaration or a statement belongs here.
     syncStarters =
       [ TkTypedef
       , TkExtern
       , TkStatic
       , TkInline
+      , TkVoid
+      , TkCharKw
+      , TkShort
+      , TkIntKw
+      , TkLong
+      , TkFloatKw
+      , TkDouble
+      , TkSigned
+      , TkUnsigned
+      , TkBool
+      , TkComplex
+      , TkInt128
+      , TkConst
+      , TkVolatile
+      , TkRestrict
       , TkIf
       , TkWhile
       , TkFor
@@ -285,9 +304,15 @@ parsePrimary = do
           expect TkRParen
           pure e
     _ -> do
-      perr loc "expected expression"
-      advance
+      t <- cur
+      perrTok t "E0011" "expected an expression" (Just "expected a value here")
+      -- Do not eat a token that closes the surrounding construct. Swallowing
+      -- the ';' of `int x = ;` left the caller's expect(';') looking at the
+      -- next line, which turned one mistake into two.
+      unless (tokKind t `elem` closers) advance
       pure (mkExpr loc (EInt 0 noSuffix))
+      where
+        closers = [TkSemi, TkRParen, TkRBrace, TkRBracket, TkComma, TkEof]
 
 parsePostfixExpr :: P Expr
 parsePostfixExpr = parsePrimary >>= go

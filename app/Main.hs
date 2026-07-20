@@ -249,20 +249,28 @@ toLowerAscii ch
 
 -- | Parse one translation unit, threading the shared TypeContext so tags
 -- accumulate across units.
-parseTU :: DiagSink -> PPOptions -> TypeContext -> FilePath -> IO (Maybe (Program, TypeContext, Bool))
+--
+-- Returns whatever it managed to parse even when it reported errors, so the
+-- later passes can keep finding real problems in the parts that are intact.
+-- Only a preprocessor failure yields nothing, because then there is no text to
+-- lex at all.
+parseTU
+  :: DiagSink
+  -> PPOptions
+  -> TypeContext
+  -> FilePath
+  -> IO (Program, TypeContext, Bool, Bool)
 parseTU sink ppopt tc path = do
   (text, ppMsgs) <- preprocess ppopt path
   sinkReport sink ppMsgs
   if hasErrors ppMsgs
-    then pure Nothing
+    then pure ([], tc, False, True)
     else do
       let (toks, lexMsgs) = tokenize path text
           (prog, tc', sawI128, parseMsgs) = parseProgram tc toks
           msgs = lexMsgs ++ parseMsgs
       sinkReport sink msgs
-      if hasErrors msgs
-        then pure Nothing
-        else pure (Just (prog, tc', sawI128))
+      pure (prog, tc', sawI128, hasErrors msgs)
 
 compile :: DiagSink -> Options -> PPOptions -> IO ()
 compile sink opts ppopt = do
@@ -275,16 +283,12 @@ compile sink opts ppopt = do
   --
   -- Each unit's file-scope statics are mangled with its own index, which is
   -- what keeps them from colliding once the units are merged.
-  (merged, tc1, sawI128, failed) <-
+  (merged, tc1, sawI128, parseFailed) <-
     foldMTU (\i tc path -> do
-      r <- parseTU sink ppopt tc path
-      case r of
-        Nothing -> pure ([], tc, False, True)
-        Just (prog, tc', saw) ->
-          pure (mangleStatics (optStaticPrefix opts) i prog, tc', saw, False))
+      (prog, tc', saw, bad) <- parseTU sink ppopt tc path
+      pure (mangleStatics (optStaticPrefix opts) i prog, tc', saw, bad))
       newTypeContext
       (zip [0 ..] inputs)
-  when failed (finish sink inputs)
 
   -- Any unit that used __int128 needs the u128 helper runtime as one more unit.
   (merged', tc2) <-
@@ -298,8 +302,10 @@ compile sink opts ppopt = do
           then fatal "failed to parse the __int128 runtime"
           else pure (merged ++ mangleStatics "stU" 0 rprog, tc')
 
+  -- Check what parsed even when some of it did not. A syntax error and a type
+  -- error in the same build should come out of the same run.
   let sr = semaCheck tc2 merged'
-  sinkReport sink (srMsgs sr)
+  sinkReport sink (semaAfterParseErrors parseFailed (srMsgs sr))
   -- Ask the sink, not the message list: -Werror turns a warning into an error
   -- during reporting, which the pass that produced it cannot know.
   semaFailed <- sinkFailed sink
@@ -361,6 +367,25 @@ foldMTU f tc0 = go [] tc0 False False
     go acc tc saw bad ((i, path) : rest) = do
       (prog, tc', s, b) <- f i tc path
       go (acc ++ prog) tc' (saw || s) (bad || b) rest
+
+-- | What to do with sema's findings when the parse did not fully succeed.
+--
+-- Errors are kept, which is the point: a syntax error and a type error in one
+-- build should come out of one run. Some of them can be fallout, since a
+-- declaration the parser could not read is one sema never saw, so later uses
+-- of that name read as undeclared. Suppressing the whole class would undo the
+-- reason for checking at all (it is the ordinary case, a missing semicolon in
+-- one function and a real type error in another, that matters most), and the
+-- syntax errors print first, so the order to fix things in is already on
+-- screen.
+--
+-- Warnings are dropped. A warning is advice about code you intend to keep, and
+-- on a file that does not parse it is as likely to be an artefact of the lost
+-- tree as a real finding: an unused variable whose only use was in a statement
+-- the parser dropped. Nobody acts on warnings in a build that failed anyway.
+semaAfterParseErrors :: Bool -> [Message] -> [Message]
+semaAfterParseErrors False ms = ms
+semaAfterParseErrors True ms = filter ((/= Warning) . msgSeverity) ms
 
 -- | Print the closing count and stop. Every failure path goes through here, so
 -- the last line a build prints is always the same shape.
