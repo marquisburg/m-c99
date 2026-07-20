@@ -17,22 +17,21 @@ with gcc).
 
 ## Current state
 
-Two of these fail, and both are checked in deliberately: each is a real,
+One of these fails, and it is checked in deliberately: it is a real,
 reproduced miscompile and the file is the smallest program that shows it.
 
 | File | What is wrong | Issue |
 |---|---|---|
-| `shift_nested.c` | a shift whose left operand is itself a shift becomes logical | #13 |
 | `many_args.c` | a call with many arguments clobbers the caller's floating-point locals | #14 |
 
-Both were found while fixing others, which is the argument for keeping a
-corpus rather than a checklist.
+That one is a backend fault. The fix is known and is one line in
+MettleToolchain, but it cannot be shipped from here yet; see the issue.
 
-The other twenty-two pass, including the seven that were failing when this
+The other twenty-four pass, including the eight that were failing when this
 directory was created: `++`/`--` on a scalar global, signed bit-fields,
-`int >> unsigned`, a `case` in a nested block (and Duff's device), flexible
-array members, a function pointer returning a struct, and a variadic call
-destroying a `double`.
+`int >> unsigned`, a nested shift, a `case` in a nested block (and Duff's
+device), flexible array members, a function pointer returning a struct, and a
+variadic call destroying a `double`.
 
 ## Adding a case
 
