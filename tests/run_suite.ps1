@@ -136,7 +136,8 @@ Need (Run-Diag "diag/unused" @("tests\diag\unused.c") $true `
   @("warning: unused variable 'scratch'",
     "\^\^\^\^\^\^\^ declared here and never read",
     "rename it to '_scratch'") `
-  @("unused variable 'used'", "unused variable '_intentional'"))
+  @("unused variable 'used'", "unused variable '_intentional'",
+    "unused variable 'written'"))
 
 # -Wno- silences it; -Werror promotes it and fails the build.
 Need (Run-Diag "diag/unused_off" @("-Wno-unused", "tests\diag\unused.c") $true `
@@ -150,6 +151,7 @@ Need (Run-Diag "diag/unused_werror" @("-Werror", "tests\diag\unused.c") $false `
 Need (Run-Diag "diag/phases" @("tests\diag\phases.c") $false `
   @("error\[E0010\]: expected ;",
     "error\[E0102\]: undeclared identifier 'undeclared_thing'",
+    "a syntax error there may have hidden it",
     "due to 2 previous errors") `
   @("unused variable", "due to [3-9] previous"))
 

@@ -375,9 +375,10 @@ foldMTU f tc0 = go [] tc0 False False
 -- declaration the parser could not read is one sema never saw, so later uses
 -- of that name read as undeclared. Suppressing the whole class would undo the
 -- reason for checking at all (it is the ordinary case, a missing semicolon in
--- one function and a real type error in another, that matters most), and the
--- syntax errors print first, so the order to fix things in is already on
--- screen.
+-- one function and a real type error in another, that matters most). Instead
+-- every undeclared-identifier error in this situation says on its own help
+-- line that it may be fallout, so nobody has to know the rule to read the
+-- output correctly.
 --
 -- Warnings are dropped. A warning is advice about code you intend to keep, and
 -- on a file that does not parse it is as likely to be an artefact of the lost
@@ -385,7 +386,17 @@ foldMTU f tc0 = go [] tc0 False False
 -- the parser dropped. Nobody acts on warnings in a build that failed anyway.
 semaAfterParseErrors :: Bool -> [Message] -> [Message]
 semaAfterParseErrors False ms = ms
-semaAfterParseErrors True ms = filter ((/= Warning) . msgSeverity) ms
+semaAfterParseErrors True ms =
+  map annotate (filter ((/= Warning) . msgSeverity) ms)
+  where
+    -- "did you mean" already explains the likely cause; leave those alone.
+    annotate m
+      | msgCode m == Just "E0102"
+      , Nothing <- msgHelp m =
+          withHelp
+            "if this is declared above, a syntax error there may have hidden it; fix those first"
+            m
+      | otherwise = m
 
 -- | Print the closing count and stop. Every failure path goes through here, so
 -- the last line a build prints is always the same shape.

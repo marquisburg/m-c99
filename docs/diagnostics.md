@@ -90,7 +90,11 @@ trains people to pass `-w`.
 `unused` therefore says nothing about a parameter (an unused one is often
 required by a signature), nothing about anything `extern`, `static` or global
 (another unit may read it), and nothing about a name starting with `_`, which
-is how you say "declared on purpose, not used".
+is how you say "declared on purpose, not used". Any resolution of the name
+counts as a use, writes included, so `x = f();` keeps `x` quiet. That is what
+gcc's `-Wunused-variable` does as well; set-but-never-read is a stricter,
+separate check (gcc's `-Wunused-but-set-variable`) and would get its own group
+if added.
 
 `missing-return` asks whether control can fall off the end, and every case it
 is unsure about answers "no". It understands that a `switch` covering every
@@ -164,13 +168,20 @@ Every input file is parsed even when an earlier one failed, and the type
 checker runs on whatever parsed, so a missing semicolon in one function and a
 type error in another come out of the same run rather than one build apiece.
 
-That has one honest cost. A declaration the parser could not read is one the
-checker never saw, so a later use of that name is reported as undeclared even
-though you wrote the declaration. The syntax errors print first, so the order
-to fix things in is on screen, but a run with parse errors in it can contain
-knock-on errors that go away on their own. Suppressing the whole class was the
-alternative, and it would have thrown away the ordinary case (which is the
-common one) to tidy up the pathological one.
+A declaration the parser could not read is one the checker never saw, so a
+later use of that name reports as undeclared even though you wrote the
+declaration. Rather than suppress those (which would throw away the ordinary
+case, one syntax error and one unrelated type error, to tidy up the
+pathological one), every undeclared-identifier error in a run with parse
+errors says so on its own help line:
+
+```
+   = help: if this is declared above, a syntax error there may have hidden it; fix those first
+```
+
+So the output reads correctly without knowing the rule: the syntax errors
+print first, and any undeclared error that might be their fallout announces
+itself.
 
 Sema *warnings* are dropped when the parse failed, for the same reason in
 reverse: a warning is advice about code you mean to keep, and on a file that
