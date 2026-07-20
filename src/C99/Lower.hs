@@ -21,7 +21,7 @@ module C99.Lower
 
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Control.Monad.State.Strict
-import Data.Bits (complement, shiftL)
+import Data.Bits (bit, complement, shiftL)
 import Data.Char (ord)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe, isJust)
@@ -678,7 +678,23 @@ bfLoad addr m = do
   sh <- lift (constInt fn u32 (fromIntegral bitOff))
   shifted <- lift (binary fn ">>" word sh u32)
   mv <- lift (constInt fn u32 (fromIntegral (bfMask width)))
-  lift (binary fn "&" shifted mv u32)
+  raw <- lift (binary fn "&" shifted mv u32)
+  -- A bit-field declared with a signed type is a signed type (C99 6.7.2.1),
+  -- so its top bit is a sign bit. Masking alone leaves the value zero-extended,
+  -- and a 4-bit field holding -1 reads as 15.
+  --
+  -- Sign-extend with (v XOR s) - s, where s is the field's sign bit. The
+  -- textbook way is to shift the field up to the top of the word and back down
+  -- arithmetically, but a shift whose left operand is itself a shift currently
+  -- lowers to a logical shift, so this uses only XOR and subtract.
+  if width > 0 && width < 32 && not (typeIsUnsigned (memType m))
+    then do
+      i32 <- i32L
+      sv <- lift (cast fn raw i32)
+      s <- lift (constInt fn i32 (fromIntegral (bit (width - 1) :: Integer)))
+      flipped <- lift (binary fn "^" sv s i32)
+      lift (binary fn "-" flipped s i32)
+    else pure raw
 
 bfStore :: Value -> Member -> Value -> Lower ()
 bfStore addr m val = do
