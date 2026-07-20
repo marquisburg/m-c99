@@ -393,6 +393,65 @@ isAddrGlobal :: Symbol -> Bool
 isAddrGlobal sym =
   symIsGlobal sym && (symAddrTaken sym || isAgg (symType sym))
 
+-- | How to reach an lvalue's storage.
+--
+-- A plain scalar global has no address to take: @mtlc_address_of@ is defined
+-- only for locals and parameters, which is why an addressable global is turned
+-- into a pointer global by the constructor in the first place. Such a global
+-- has to be read and written through its own handle.
+--
+-- Assignment already knew this and went through the handle. The
+-- read-modify-write sites did not: they asked 'genLvalueAddr' for an address,
+-- got the result of an unsupported @addressOf@, and loaded 0 through it. So
+-- @int g = 5; ++g@ yielded 1.
+data LvalRef
+  = -- | Read it as a value, write it with @assign@.
+    LvalHandle Value
+  | -- | Load and store through this address.
+    LvalAddr Value
+
+lvalRef :: Expr -> Lower LvalRef
+lvalRef e = case exNode e of
+  EIdent _ (Just sid) -> do
+    sym <- symOf sid
+    fn <- gets lsFn
+    if symIsGlobal sym && not (isAddrGlobal sym)
+      then LvalHandle <$> lift (globalRef fn (symLinkName sym))
+      else LvalAddr <$> genLvalueAddr e
+  _ -> LvalAddr <$> genLvalueAddr e
+
+readLval :: LvalRef -> Type -> Lower Value
+readLval (LvalHandle v) _ = pure v
+readLval (LvalAddr a) t = do
+  fn <- gets lsFn
+  ty <- mtlcOf t
+  lift (load fn a ty)
+
+-- | Copy a value into a fresh temporary.
+--
+-- 'readLval' on a 'LvalHandle' hands back the storage itself, not a snapshot
+-- of it, so a later write through the same handle changes what the earlier
+-- read appears to say. @g++@ has to yield the value from before the increment,
+-- which means copying it out first. A load through an address is already a
+-- snapshot, but copying it too keeps the one rule instead of two.
+materialize :: Value -> Type -> Lower Value
+materialize v t = do
+  fn <- gets lsFn
+  ty <- mtlcOf t
+  nm <- freshTmp "old"
+  tmp <- lift (local fn nm ty)
+  lift (assign fn tmp v)
+  pure tmp
+
+writeLval :: LvalRef -> Type -> Value -> Lower ()
+writeLval (LvalHandle h) _ v = do
+  fn <- gets lsFn
+  lift (assign fn h v)
+writeLval (LvalAddr a) t v = do
+  fn <- gets lsFn
+  ty <- mtlcOf t
+  lift (store fn a v ty)
+
 -- | Allocate and zero an addressable global's storage if it is still null, then
 -- hand back the pointer global. Idempotent, so the constructor and any lazy use
 -- can both call it.
@@ -835,13 +894,12 @@ genExpr e = case exNode e of
   EBinary op l r -> genBinary e op l r
   EUnary op x -> genUnary e op x
   EPostfix op x -> do
-    fn <- gets lsFn
-    addr <- genLvalueAddr x
-    lt <- mtlcOf (exprTy x)
-    cur <- lift (load fn addr lt)
+    ref <- lvalRef x
+    cur <- readLval ref (exprTy x)
+    old <- materialize cur (exprTy x)
     nv <- stepOne (exprTy x) (exprTy e) cur (if op == PostInc then "+" else "-")
-    lift (store fn addr nv lt)
-    pure cur -- the postfix value is the OLD one
+    writeLval ref (exprTy x) nv
+    pure old -- the postfix value is the one from before the write
   EAssign op l r -> genAssign e op l r
   ECall f args _ -> genCall e f args
   EIndex base _ -> do
@@ -1047,12 +1105,10 @@ genUnary e op x = case op of
     lift (unary fn "!" v i32)
   where
     incDec o = do
-      fn <- gets lsFn
-      addr <- genLvalueAddr x
-      lt <- mtlcOf (exprTy x)
-      cur <- lift (load fn addr lt)
+      ref <- lvalRef x
+      cur <- readLval ref (exprTy x)
       nv <- stepOne (exprTy x) (exprTy e) cur o
-      lift (store fn addr nv lt)
+      writeLval ref (exprTy x) nv
       pure nv
 
 genBinary :: Expr -> BinOp -> Expr -> Expr -> Lower Value
@@ -1202,9 +1258,8 @@ genAssign e op lhs rhs
       | AssignOp bop <- op = do
           fn <- gets lsFn
           rv <- genExpr rhs
-          addr <- genLvalueAddr lhs
-          lt <- mtlcOf (exprTy lhs)
-          cur <- lift (load fn addr lt)
+          ref <- lvalRef lhs
+          cur <- readLval ref (exprTy lhs)
           nv <- case typeDecay (exprTy lhs) of
             -- p += n / p -= n move by n elements, not n bytes
             TPtr el | bop == Add || bop == Sub ->
@@ -1212,7 +1267,7 @@ genAssign e op lhs rhs
             _ -> do
               t <- mtlcOf (exprTy e)
               lift (binary fn (binOpText bop) cur rv t)
-          lift (store fn addr nv lt)
+          writeLval ref (exprTy lhs) nv
           pure nv
       | otherwise = do
           fn <- gets lsFn
