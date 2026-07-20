@@ -43,6 +43,39 @@ function Run-Case($Name, $ArgsList, $ExpectExit, $ExpectOutContains) {
   return $true
 }
 
+# Diagnostics are asserted with regexes rather than golden files, so a case
+# pins the load-bearing content (the code, the caret run, the suggestion)
+# without breaking every time a sentence is reworded.
+#
+# MustNotMatch is what actually pins cascade suppression: it is the only way to
+# say "and nothing else was reported".
+function Run-Diag($Name, $ArgsList, $ShouldCompile, $MustMatch, $MustNotMatch) {
+  $dir = Join-Path $Scratch $Name
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $exe = Join-Path $dir "out.exe"
+  $allArgs = @() + $ArgsList + @("--color=never", "-o", $exe)
+  # Width so console wrapping cannot break a multi-word match.
+  $out = (& $CC @allArgs 2>&1 | Out-String -Width 4096)
+  $code = $LASTEXITCODE
+  $out | Set-Content -Path (Join-Path $dir "diag.log") -NoNewline
+  if ($null -ne $ShouldCompile) {
+    if ($ShouldCompile -and $code -ne 0) {
+      Write-Host "FAIL $Name expected success, exit $code"; return $false
+    }
+    if ((-not $ShouldCompile) -and $code -eq 0) {
+      Write-Host "FAIL $Name expected failure, exit 0"; return $false
+    }
+  }
+  foreach ($p in $MustMatch) {
+    if ($out -notmatch $p) { Write-Host "FAIL $Name missing /$p/"; return $false }
+  }
+  foreach ($p in $MustNotMatch) {
+    if ($out -match $p) { Write-Host "FAIL $Name unexpected /$p/"; return $false }
+  }
+  Write-Host "PASS $Name"
+  return $true
+}
+
 $fail = 0
 function Need($ok) { if (-not $ok) { $script:fail++ } }
 
@@ -75,6 +108,55 @@ Need (Run-Case "gaps/storage_stack" @("tests\storage_stack.c") 0 $null)
 Need (Run-Case "gaps/global_agg_init" @("tests\global_agg_init.c") 7 $null)
 Need (Run-Case "gaps/global_array_init" @("tests\global_array_init.c") 6 $null)
 Need (Run-Case "gaps/addr_taken_global_init" @("tests\addr_taken_global_init.c") 0 $null)
+
+# ---- diagnostics quality ----
+
+# The caret run is asserted literally, which pins the column, the length and
+# the label in one pattern.
+Need (Run-Diag "diag/undeclared" @("tests\diag\undeclared.c") $false `
+  @("error\[E0102\]: undeclared identifier 'coutner'",
+    "\^\^\^\^\^\^\^ not found in this scope",
+    "= help: did you mean 'counter'\?",
+    "--> .*undeclared\.c:6:12") $null)
+
+# One mistake, one diagnostic. Before recovery this reported three.
+Need (Run-Diag "diag/cascade" @("tests\diag\cascade.c") $false `
+  @("error\[E0010\]: expected ;",
+    "due to 1 previous error") `
+  @("expected a declaration", "due to [2-9] previous"))
+
+Need (Run-Diag "diag/unused" @("tests\diag\unused.c") $true `
+  @("warning: unused variable 'scratch'",
+    "\^\^\^\^\^\^\^ declared here and never read",
+    "rename it to '_scratch'") `
+  @("unused variable 'used'", "unused variable '_intentional'"))
+
+# -Wno- silences it; -Werror promotes it and fails the build.
+Need (Run-Diag "diag/unused_off" @("-Wno-unused", "tests\diag\unused.c") $true `
+  $null @("unused variable"))
+Need (Run-Diag "diag/unused_werror" @("-Werror", "tests\diag\unused.c") $false `
+  @("unused variable 'scratch'", "due to 1 previous error") $null)
+
+Need (Run-Diag "diag/redefinition" @("tests\diag\redefinition.c") $false `
+  @("error\[E0100\]: redefinition of 'x'",
+    "note: previous declaration of 'x' is here",
+    "--> .*redefinition\.c:2:1") $null)
+
+# Lexing must continue past a stray character, so the later error still shows.
+Need (Run-Diag "diag/stray_char" @("tests\diag\stray_char.c") $false `
+  @("error\[E0001\]: unexpected character '@'",
+    "undeclared_after_stray") $null)
+
+Need (Run-Diag "diag/json" @("--error-format=json", "tests\diag\undeclared.c") $false `
+  @('"severity":"error"', '"code":"E0102"', '"line":6', '"column":12', '"length":7') $null)
+
+# --explain works without an input file at all.
+$exp = (& $CC --explain e0102 2>&1 | Out-String -Width 4096)
+if ($exp -match "error\[E0102\]" -and $exp -match "not in scope") {
+  Write-Host "PASS diag/explain"
+} else {
+  Write-Host "FAIL diag/explain"; $fail++
+}
 
 # -E check
 $Edir = Join-Path $Scratch "preprocess"

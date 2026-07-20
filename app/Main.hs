@@ -6,12 +6,14 @@ module Main (main) where
 
 import Control.Monad (forM, unless, when)
 import Data.List (isPrefixOf)
-import System.Environment (getArgs)
+import System.Environment (getArgs, lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
-import System.IO (hPutStrLn, stderr)
+import System.IO (hIsTerminalDevice, hPutStrLn, stderr)
 
 import C99.Common
 import C99.CType (TypeContext, newTypeContext)
+import C99.Diag
+import C99.Explain (explain, explainIndex)
 import C99.Ast (Program)
 import C99.Lexer (tokenize)
 import C99.Lower (lowerProgram)
@@ -31,6 +33,13 @@ data Options = Options
   , optStaticPrefix :: String
   , optIncludes :: [FilePath]
   , optInputs :: [FilePath]
+  , -- | @auto@ unless @--color=always@/@never@ forced it.
+    optColor :: Maybe Bool
+  , optNoWarn :: [WarnGroup]
+  , optWarnError :: !Bool
+  , optMaxErrors :: !Int
+  , optJson :: !Bool
+  , optExplain :: Maybe String
   }
 
 defaults :: Options
@@ -44,6 +53,12 @@ defaults =
     , optStaticPrefix = "st"
     , optIncludes = []
     , optInputs = []
+    , optColor = Nothing
+    , optNoWarn = []
+    , optWarnError = False
+    , optMaxErrors = 100
+    , optJson = False
+    , optExplain = Nothing
     }
 
 usage :: IO ()
@@ -64,14 +79,42 @@ usage = do
     , "  --static-prefix=<p>  prefix for file-scope static mangling"
     , "  -h, --help    this help"
     , ""
+    , "Diagnostics:"
+    , "  -Wno-<group>  silence a warning group (see --help-warnings)"
+    , "  -Werror       treat warnings as errors"
+    , "  --max-errors=N  stop after N errors (default 100, 0 = no limit)"
+    , "  --error-format=json  one JSON object per diagnostic, for editors"
+    , "  --color=auto|always|never  (auto honours NO_COLOR and CLICOLOR_FORCE)"
+    , "  --explain <CODE>  what an error code means, and how to fix it"
+    , "  --help-warnings   list the warning groups"
+    , ""
     , "Backend: " ++ v
     ]
+
+warningsHelp :: IO ()
+warningsHelp =
+  mapM_
+    (hPutStrLn stderr)
+    ( [ "Warning groups. Each is on by default and off with -Wno-<group>."
+      , ""
+      ]
+        ++ map (\g -> "  -Wno-" ++ warnGroupName g) allWarnGroups
+        ++ [ ""
+           , "  -Werror   turn every warning that is still on into an error"
+           ]
+    )
 
 parseArgs :: [String] -> Options -> IO Options
 parseArgs [] o = pure o {optInputs = reverse (optInputs o), optIncludes = reverse (optIncludes o)}
 parseArgs (a : rest) o = case a of
   "-h" -> usage >> exitSuccess
   "--help" -> usage >> exitSuccess
+  "--help-warnings" -> warningsHelp >> exitSuccess
+  "--explain" -> case rest of
+    (c : more) -> parseArgs more o {optExplain = Just c}
+    [] -> fatal "missing argument for --explain"
+  "-Werror" -> parseArgs rest o {optWarnError = True}
+  "-w" -> parseArgs rest o {optNoWarn = allWarnGroups}
   "-o" -> case rest of
     (p : more) -> parseArgs more o {optOutput = Just p}
     [] -> fatal "missing argument for -o"
@@ -89,17 +132,87 @@ parseArgs (a : rest) o = case a of
         parseArgs rest o {optIncludes = drop 2 a : optIncludes o}
     | "--static-prefix=" `isPrefixOf` a ->
         parseArgs rest o {optStaticPrefix = drop 16 a}
+    | "--explain=" `isPrefixOf` a -> parseArgs rest o {optExplain = Just (drop 10 a)}
+    | "--max-errors=" `isPrefixOf` a -> case reads (drop 13 a) of
+        [(n, "")] -> parseArgs rest o {optMaxErrors = if n <= 0 then maxBound else n}
+        _ -> fatal ("--max-errors wants a number, got '" ++ drop 13 a ++ "'")
+    | a == "--error-format=json" -> parseArgs rest o {optJson = True}
+    | "--error-format=" `isPrefixOf` a ->
+        fatal ("unknown --error-format '" ++ drop 15 a ++ "' (want: human, json)")
+    | "--color=" `isPrefixOf` a -> case drop 8 a of
+        "always" -> parseArgs rest o {optColor = Just True}
+        "never" -> parseArgs rest o {optColor = Just False}
+        "auto" -> parseArgs rest o {optColor = Nothing}
+        v -> fatal ("unknown --color '" ++ v ++ "' (want: auto, always, never)")
+    | "-Wno-" `isPrefixOf` a -> case lookupGroup (drop 5 a) of
+        Just g -> parseArgs rest o {optNoWarn = g : optNoWarn o}
+        Nothing -> fatal (unknownWarning (drop 5 a))
+    | a == "-Wall" || a == "-Wextra" -> parseArgs rest o -- every group is already on
     | "-" `isPrefixOf` a -> fatal ("unknown option '" ++ a ++ "'")
     | otherwise -> parseArgs rest o {optInputs = a : optInputs o}
 
 fatal :: String -> IO a
 fatal msg = hPutStrLn stderr ("c99mtlc: " ++ msg) >> exitFailure
 
+lookupGroup :: String -> Maybe WarnGroup
+lookupGroup n = lookup n [(warnGroupName g, g) | g <- allWarnGroups]
+
+-- | Getting a flag name slightly wrong should not mean reading the manual.
+unknownWarning :: String -> String
+unknownWarning n =
+  "unknown warning group '"
+    ++ n
+    ++ "'"
+    ++ case closestCandidate n (map warnGroupName allWarnGroups) of
+      Just c -> "; did you mean '-Wno-" ++ c ++ "'?"
+      Nothing -> "; see --help-warnings"
+
+-- | @auto@: colour when stderr is a terminal, with the environment able to
+-- override in both directions. CLICOLOR_FORCE wins over NO_COLOR, which is the
+-- order everyone else settled on.
+resolveColor :: Maybe Bool -> IO Bool
+resolveColor (Just b) = pure b
+resolveColor Nothing = do
+  force <- lookupEnv "CLICOLOR_FORCE"
+  no <- lookupEnv "NO_COLOR"
+  term <- lookupEnv "TERM"
+  tty <- hIsTerminalDevice stderr
+  pure $ case () of
+    _
+      | Just v <- force, v /= "0" -> True
+      | Just _ <- no -> False
+      | Just "dumb" <- term -> False
+      | otherwise -> tty
+
 main :: IO ()
 main = do
   args <- getArgs
   opts <- parseArgs args defaults
+
+  case optExplain opts of
+    Just c -> case explain c of
+      Just body -> mapM_ putStrLn body >> exitSuccess
+      Nothing
+        | map toLowerAscii c `elem` ["list", "all"] ->
+            mapM_ putStrLn explainIndex >> exitSuccess
+        | otherwise -> do
+            hPutStrLn stderr ("c99mtlc: no such error code '" ++ c ++ "'")
+            mapM_ (hPutStrLn stderr) explainIndex
+            exitFailure
+    Nothing -> pure ()
+
   when (null (optInputs opts)) (usage >> exitFailure)
+
+  color <- resolveColor (optColor opts)
+  sink <-
+    newDiagSink
+      defaultDiagOptions
+        { doColor = color
+        , doSuppressed = optNoWarn opts
+        , doWarnAsError = optWarnError opts
+        , doMaxErrors = optMaxErrors opts
+        , doJson = optJson opts
+        }
 
   -- The builtin include dir (freestanding + CRT declarations) is searched
   -- last. One cache for the whole run: every TU includes the same headers,
@@ -116,50 +229,55 @@ main = do
     then do
       oks <- forM (optInputs opts) $ \path -> do
         (text, msgs) <- preprocess ppopt path
-        report msgs
+        sinkReport sink msgs
         if hasErrors msgs then pure False else putStr text >> pure True
-      unless (and oks) (hPutStrLn stderr "preprocess failed" >> exitFailure)
-    else compile opts ppopt
+      unless (and oks) $ do
+        finish sink (optInputs opts)
+    else compile sink opts ppopt
 
-report :: [Message] -> IO ()
-report = mapM_ (hPutStrLn stderr . formatMessage)
+toLowerAscii :: Char -> Char
+toLowerAscii ch
+  | ch >= 'A' && ch <= 'Z' = toEnum (fromEnum ch + 32)
+  | otherwise = ch
 
 -- | Parse one translation unit, threading the shared TypeContext so tags
 -- accumulate across units.
-parseTU :: PPOptions -> TypeContext -> FilePath -> IO (Maybe (Program, TypeContext, Bool))
-parseTU ppopt tc path = do
+parseTU :: DiagSink -> PPOptions -> TypeContext -> FilePath -> IO (Maybe (Program, TypeContext, Bool))
+parseTU sink ppopt tc path = do
   (text, ppMsgs) <- preprocess ppopt path
-  report ppMsgs
+  sinkReport sink ppMsgs
   if hasErrors ppMsgs
     then pure Nothing
     else do
       let (toks, lexMsgs) = tokenize path text
           (prog, tc', sawI128, parseMsgs) = parseProgram tc toks
           msgs = lexMsgs ++ parseMsgs
-      report msgs
+      sinkReport sink msgs
       if hasErrors msgs
-        then do
-          hPutStrLn stderr $
-            show (errorCount msgs) ++ " error(s) generated while parsing " ++ path ++ "."
-          pure Nothing
+        then pure Nothing
         else pure (Just (prog, tc', sawI128))
 
-compile :: Options -> PPOptions -> IO ()
-compile opts ppopt = do
+compile :: DiagSink -> Options -> PPOptions -> IO ()
+compile sink opts ppopt = do
   let inputs = optInputs opts
       output = maybe (if optObjOnly opts then "a.obj" else "a.exe") id (optOutput opts)
 
+  -- Parse every unit before giving up. Stopping at the first broken file hides
+  -- the state of the rest, which turns one build into several: the whole point
+  -- of a batch compiler is that one run tells you everything that is wrong.
+  --
   -- Each unit's file-scope statics are mangled with its own index, which is
   -- what keeps them from colliding once the units are merged.
-  (merged, tc1, sawI128) <-
+  (merged, tc1, sawI128, failed) <-
     foldMTU (\i tc path -> do
-      r <- parseTU ppopt tc path
+      r <- parseTU sink ppopt tc path
       case r of
-        Nothing -> exitFailure
+        Nothing -> pure ([], tc, False, True)
         Just (prog, tc', saw) ->
-          pure (mangleStatics (optStaticPrefix opts) i prog, tc', saw))
+          pure (mangleStatics (optStaticPrefix opts) i prog, tc', saw, False))
       newTypeContext
       (zip [0 ..] inputs)
+  when failed (finish sink inputs)
 
   -- Any unit that used __int128 needs the u128 helper runtime as one more unit.
   (merged', tc2) <-
@@ -168,27 +286,26 @@ compile opts ppopt = do
       else do
         let (toks, lexMsgs) = tokenize "<c99m-u128-runtime>" u128RuntimeSrc
             (rprog, tc', _, pMsgs) = parseProgram tc1 toks
-        report (lexMsgs ++ pMsgs)
+        sinkReport sink (lexMsgs ++ pMsgs)
         if hasErrors (lexMsgs ++ pMsgs)
           then fatal "failed to parse the __int128 runtime"
           else pure (merged ++ mangleStatics "stU" 0 rprog, tc')
 
   let sr = semaCheck tc2 merged'
-  report (srMsgs sr)
-  when (hasErrors (srMsgs sr)) $ do
-    hPutStrLn stderr (show (errorCount (srMsgs sr)) ++ " error(s) generated.")
-    exitFailure
+  sinkReport sink (srMsgs sr)
+  -- Ask the sink, not the message list: -Werror turns a warning into an error
+  -- during reporting, which the pass that produced it cannot know.
+  semaFailed <- sinkFailed sink
+  when semaFailed (finish sink inputs)
 
   (mmod, lowMsgs) <- lowerProgram sr
-  report lowMsgs
+  sinkReport sink lowMsgs
+  lowFailed <- sinkFailed sink
   case mmod of
-    Nothing -> do
-      hPutStrLn stderr ("lowering failed (" ++ show (errorCount lowMsgs) ++ " error(s)).")
-      exitFailure
-    Just m | hasErrors lowMsgs -> do
+    Nothing -> finish sink inputs
+    Just m | lowFailed -> do
       Mtlc.moduleDestroy m
-      hPutStrLn stderr ("lowering failed (" ++ show (errorCount lowMsgs) ++ " error(s)).")
-      exitFailure
+      finish sink inputs
     Just m -> do
       if optEmitIrOnly opts
         then do
@@ -227,13 +344,20 @@ compile opts ppopt = do
 -- | Fold the translation units, accumulating the merged program, the shared
 -- TypeContext, and whether any unit used __int128.
 foldMTU
-  :: (Int -> TypeContext -> FilePath -> IO (Program, TypeContext, Bool))
+  :: (Int -> TypeContext -> FilePath -> IO (Program, TypeContext, Bool, Bool))
   -> TypeContext
   -> [(Int, FilePath)]
-  -> IO (Program, TypeContext, Bool)
-foldMTU f tc0 = go [] tc0 False
+  -> IO (Program, TypeContext, Bool, Bool)
+foldMTU f tc0 = go [] tc0 False False
   where
-    go acc tc saw [] = pure (acc, tc, saw)
-    go acc tc saw ((i, path) : rest) = do
-      (prog, tc', s) <- f i tc path
-      go (acc ++ prog) tc' (saw || s) rest
+    go acc tc saw bad [] = pure (acc, tc, saw, bad)
+    go acc tc saw bad ((i, path) : rest) = do
+      (prog, tc', s, b) <- f i tc path
+      go (acc ++ prog) tc' (saw || s) (bad || b) rest
+
+-- | Print the closing count and stop. Every failure path goes through here, so
+-- the last line a build prints is always the same shape.
+finish :: DiagSink -> [FilePath] -> IO a
+finish sink inputs = do
+  sinkSummary sink (case inputs of (p : _) -> p; [] -> "input")
+  exitFailure

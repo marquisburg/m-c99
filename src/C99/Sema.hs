@@ -20,11 +20,14 @@ import Control.Monad (forM, unless, when)
 import Control.Monad.State.Strict
 import Data.Bits (complement, shiftL, shiftR, xor, (.&.), (.|.))
 import qualified Data.Map.Strict as M
+import qualified Data.Set as S
+import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
 
 import C99.Ast
 import C99.Common
 import C99.CType
+import C99.Diag (closestCandidate)
 
 data SemaResult = SemaResult
   { srProgram :: Program
@@ -51,6 +54,11 @@ data SemaState = SemaState
   , ssLoopDepth :: !Int
   , ssSwitchDepth :: !Int
   , ssMsgs :: [Message] -- reversed
+  , -- | Where each symbol was declared, and whether anything has read it.
+    -- Kept beside the symbols rather than on 'Symbol' so the AST stays the
+    -- shape 'Lower' expects.
+    ssDeclLoc :: M.Map SymId SrcLoc
+  , ssUsed :: S.Set SymId
   }
 
 type Sema a = State SemaState a
@@ -68,6 +76,8 @@ semaCheck tc prog =
           , ssLoopDepth = 0
           , ssSwitchDepth = 0
           , ssMsgs = []
+          , ssDeclLoc = M.empty
+          , ssUsed = S.empty
           }
       (prog', st) = runState (checkProgram prog) st0
    in SemaResult
@@ -81,7 +91,15 @@ semaCheck tc prog =
 -- ---- diagnostics ----
 
 errAt :: SrcLoc -> String -> Sema ()
-errAt loc text = modify' $ \s -> s {ssMsgs = Message Error loc text : ssMsgs s}
+errAt loc text = modify' $ \s -> s {ssMsgs = diag Error loc text : ssMsgs s}
+
+-- | Record a message that has already been given a code, a span or notes.
+emit :: Message -> Sema ()
+emit m = modify' $ \s -> s {ssMsgs = m : ssMsgs s}
+
+-- | Every name visible from here, nearest scope first, for "did you mean".
+visibleNames :: Sema [String]
+visibleNames = gets (concatMap M.keys . ssScopes)
 
 -- ---- scopes and symbols ----
 
@@ -91,8 +109,58 @@ pushScope = modify' $ \s -> s {ssScopes = M.empty : ssScopes s}
 popScope :: Sema ()
 popScope = modify' $ \s -> s {ssScopes = drop 1 (ssScopes s)}
 
+-- | Close a block scope, warning about the locals nothing read.
+--
+-- The false-positive budget here is zero, so this only fires on a plain
+-- block-scope variable: never a parameter (an unused one is often required by
+-- a signature), never anything extern, static or global (another unit may
+-- read it), and never a name starting with @_@, which is the established way
+-- to say "declared on purpose, not used".
+popScopeChecked :: Sema ()
+popScopeChecked = do
+  s <- get
+  case ssScopes s of
+    [] -> pure ()
+    (sc : _) -> do
+      let unused =
+            [ (sid, name)
+            | (name, sid) <- M.toList sc
+            , not (S.member sid (ssUsed s))
+            , not ("_" `isPrefixOf` name)
+            , Just sym <- [M.lookup sid (ssSyms s)]
+            , symKind sym == SymVar
+            , not (symIsExtern sym)
+            , not (symIsGlobal sym)
+            , not (symIsStatic sym)
+            ]
+      mapM_ warnUnused unused
+      popScope
+  where
+    warnUnused (sid, name) = do
+      mloc <- gets (M.lookup sid . ssDeclLoc)
+      case mloc of
+        Nothing -> pure ()
+        Just loc ->
+          emit
+            . withHelp
+              ( "remove it, or rename it to '_"
+                  ++ name
+                  ++ "' to keep it and say so on purpose"
+              )
+            . withLabel "declared here and never read"
+            . withSnap name
+            . withLen (length name)
+            $ (diag Warning loc ("unused variable '" ++ name ++ "'"))
+              {msgGroup = Just WUnused}
+
 lookupSym :: String -> Sema (Maybe SymId)
-lookupSym name = gets (go . ssScopes)
+lookupSym name = do
+  r <- gets (go . ssScopes)
+  -- Reading a name is what "used" means. Marking here catches every read,
+  -- including the ones inside sizeof and initializers.
+  case r of
+    Just sid -> modify' (\s -> s {ssUsed = S.insert sid (ssUsed s)}) >> pure r
+    Nothing -> pure r
   where
     go [] = Nothing
     go (sc : rest) = case M.lookup name sc of
@@ -125,7 +193,19 @@ insertSym kind name ty loc declIsExtern = do
             (SymEnumConst, SymEnumConst) -> True
             (SymTypedef, SymTypedef) -> True
             _ -> False
-      unless ok $ errAt loc ("redefinition of '" ++ name ++ "'")
+      unless ok $ do
+        prev <- gets (M.lookup sid . ssDeclLoc)
+        emit
+          . withNotes
+            [ withSnap name (withLen (length name) (note p ("previous declaration of '" ++ name ++ "' is here")))
+            | Just p <- [prev]
+            , p /= loc
+            ]
+          . withLabel "redefined here"
+          . withCode "E0100"
+          . withSnap name
+          . withLen (length name)
+          $ diag Error loc ("redefinition of '" ++ name ++ "'")
       pure sid
     Nothing -> do
       s <- get
@@ -148,6 +228,7 @@ insertSym kind name ty loc declIsExtern = do
         s
           { ssNextSym = sid + 1
           , ssSyms = M.insert sid sym (ssSyms s)
+          , ssDeclLoc = M.insert sid loc (ssDeclLoc s)
           , ssScopes = case ssScopes s of
               (sc : rest) -> M.insert name sid sc : rest
               [] -> [M.singleton name sid]
@@ -298,7 +379,15 @@ checkIdent e name
       msid <- lookupSym name
       case msid of
         Nothing -> do
-          errAt (exLoc e) ("undeclared identifier '" ++ name ++ "'")
+          names <- visibleNames
+          let base =
+                withLabel "not found in this scope" $
+                  withCode "E0102" $
+                    withLen (length name) $
+                      diag Error (exLoc e) ("undeclared identifier '" ++ name ++ "'")
+          emit $ case closestCandidate name names of
+            Just c -> withHelp ("did you mean '" ++ c ++ "'?") base
+            Nothing -> base
           pure (setTy TInt e)
         Just sid -> do
           sym <- getSym sid
@@ -610,7 +699,7 @@ checkStmt st = case stNode st of
   SCompound items -> do
     pushScope
     items' <- mapM checkBlockItem items
-    popScope
+    popScopeChecked
     pure (node (SCompound items'))
   SIf c b me -> do
     c' <- checkExpr c
@@ -631,7 +720,7 @@ checkStmt st = case stNode st of
     c' <- mapM checkExpr c
     inc' <- mapM checkExpr inc
     b' <- inLoop (checkStmt b)
-    popScope
+    popScopeChecked
     pure (node (SFor i' c' inc' b'))
   SBreak -> do
     d <- gets ssLoopDepth
