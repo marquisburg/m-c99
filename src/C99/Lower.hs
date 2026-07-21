@@ -33,21 +33,6 @@ import C99.CType
 import C99.Sema (SemaResult (..), foldConst)
 import Mtlc
 
--- | Every call to an extern variadic pads its tail to this arity, so all call
--- sites agree with the one module-level signature that mtlc allows per name.
---
--- 16, not 32, and the difference is load-bearing: a call with 17 or more
--- arguments overruns the caller's outgoing-argument area in the backend and
--- overwrites its own spilled locals. Floating-point locals go first, so
--- `double d = 3.75; printf("x"); (int)d` read 0 purely because the padding
--- made an innocent one-argument printf into a 32-argument call.
---
--- The overrun is a backend bug and it is reachable without any padding at all,
--- by writing a 17-argument call by hand. Keeping the pad under the threshold
--- stops the frontend manufacturing it for every variadic call in the program.
-variadicPad :: Int
-variadicPad = 16
-
 data LowerState = LowerState
   { lsBuilder :: Builder
   , lsFn :: Fn
@@ -356,8 +341,9 @@ memCopy dst src n
 -- ---- externs ----
 
 -- | Declare an extern function once, with a prototype-accurate signature.
--- A variadic gets its fixed parameters plus an i64 tail padded to
--- 'variadicPad', so every call site can agree on one signature.
+-- A variadic gets its fixed parameters plus the trailing argument buffer,
+-- the one variadic convention in a c99rt world: every variadic function a
+-- program can call is compiled by this compiler.
 ensureExternFn :: String -> Type -> Lower ()
 ensureExternFn name ft = do
   declared <- gets lsDeclaredExterns
@@ -368,12 +354,9 @@ ensureExternFn name ft = do
           TFunc r ps var _ -> (ps, var, r)
           _ -> ([], False, TInt)
         sret = isAgg retT && not (isArray retT)
-        nparams = max (length fixed) (if variadic then variadicPad else length fixed)
-    i64 <- i64L
     p <- i8pL
     fixedTys <- mapM mtlcOf fixed
-    let padTys = replicate (nparams - length fixed) i64
-        ptys = fixedTys ++ padTys
+    let ptys = fixedTys ++ [p | variadic]
     rt <-
       if sret
         then pure p
@@ -385,20 +368,6 @@ ensureExternFn name ft = do
   where
     isArray TArray {} = True
     isArray _ = False
-
--- | Reinterpret a float's bits as i64 through a stack slot: Win64 varargs read
--- doubles out of integer argument slots, so a numeric conversion would be wrong.
-floatBitsAsI64 :: Value -> Lower Value
-floatBitsAsI64 v = do
-  fn <- gets lsFn
-  f64 <- f64L
-  i64 <- i64L
-  d <- lift (cast fn v f64) -- default argument promotion: float -> double
-  slot <- stackBytes 8 Nothing
-  lift (store fn slot d f64)
-  ip <- lift (tyPointer i64)
-  a <- lift (cast fn slot ip)
-  lift (load fn a i64)
 
 -- ---- globals ----
 
@@ -432,7 +401,11 @@ lvalRef e = case exNode e of
     fn <- gets lsFn
     if symIsGlobal sym && not (isAddrGlobal sym)
       then LvalHandle <$> lift (globalRef fn (symLinkName sym))
-      else LvalAddr <$> genLvalueAddr e
+      else do
+        mh <- localHandle e
+        case mh of
+          Just h -> pure (LvalHandle h)
+          Nothing -> LvalAddr <$> genLvalueAddr e
   _ -> LvalAddr <$> genLvalueAddr e
 
 readLval :: LvalRef -> Type -> Lower Value
@@ -1051,6 +1024,19 @@ genIdent e sid = do
                   i32 <- i32L
                   lift (constInt fn i32 0)
 
+-- | The value handle of a plain local or parameter, when the expression is
+-- one and its storage is the handle itself (not a pointer-backed aggregate).
+localHandle :: Expr -> Lower (Maybe Value)
+localHandle e = case exNode e of
+  EIdent _ (Just sid) -> do
+    ptrs <- gets lsPtrs
+    locals <- gets lsLocals
+    sym <- symOf sid
+    if symIsGlobal sym || M.member sid ptrs
+      then pure Nothing
+      else pure (M.lookup sid locals)
+  _ -> pure Nothing
+
 genBuiltin :: Expr -> String -> [Expr] -> Maybe Type -> Lower Value
 genBuiltin _e name args mty = case name of
   "__c99m_I" -> do
@@ -1061,14 +1047,25 @@ genBuiltin _e name args mty = case name of
     im <- lift (constFloat fn f64 1)
     cplxStore addr re im
     pure addr
+  -- The va builtins reach a plain `va_list ap` variable through its value
+  -- handle, the same way an ordinary assignment does. The old path took the
+  -- variable's address and stored through it, and addressOf on a parameter
+  -- read back stale in a register-pressured function, so va_arg returned
+  -- junk inside the printf engine of all places.
   "__builtin_va_start" -> do
     mva <- gets lsVaParam
     case (mva, args) of
       (Just va, (ap : _)) -> do
-        fn <- gets lsFn
-        apAddr <- genLvalueAddr ap
-        p <- i8pL
-        lift (store fn apAddr va p)
+        mh <- localHandle ap
+        case mh of
+          Just h -> do
+            fn <- gets lsFn
+            lift (assign fn h va)
+          Nothing -> do
+            fn <- gets lsFn
+            apAddr <- genLvalueAddr ap
+            p <- i8pL
+            lift (store fn apAddr va p)
       _ -> pure ()
     noValue'
   "__builtin_va_end" -> noValue'
@@ -1076,16 +1073,25 @@ genBuiltin _e name args mty = case name of
     (ap : _) -> do
       fn <- gets lsFn
       let ty = fromMaybe TInt mty
-      apSlot <- genLvalueAddr ap
       p <- i8pL
       u64 <- u64L
-      cur <- lift (load fn apSlot p)
       t <- mtlcOf ty
-      val <- lift (load fn cur t)
       eight <- lift (constInt fn u64 8)
-      nxt <- lift (binary fn "+" cur eight p)
-      lift (store fn apSlot nxt p)
-      pure val
+      mh <- localHandle ap
+      case mh of
+        Just h -> do
+          cur <- materialize h (exprTy ap)
+          val <- lift (load fn cur t)
+          nxt <- lift (binary fn "+" cur eight p)
+          lift (assign fn h nxt)
+          pure val
+        Nothing -> do
+          apSlot <- genLvalueAddr ap
+          cur <- lift (load fn apSlot p)
+          val <- lift (load fn cur t)
+          nxt <- lift (binary fn "+" cur eight p)
+          lift (store fn apSlot nxt p)
+          pure val
     [] -> zero
   _
     | name `elem` ["__real__", "__imag__"] -> case args of
@@ -1408,26 +1414,30 @@ genCall e f args = do
             TFunc r ps var _ -> (ps, var, r)
             _ -> ([], False, exprTy e)
           sret = isAgg retT && not (isArrayTy retT)
-      i64 <- i64L
       -- Each argument value, paired with the IR type it is passed as. The
       -- pairs feed the function-pointer descriptor below, so the signature
-      -- always matches this exact call.
-      argv <- forM (zip [0 ..] args) $ \(i, a) -> do
+      -- always matches this exact call. A variadic callee takes the one
+      -- variadic shape c99rt-era code has: fixed arguments, then a buffer
+      -- of 8-byte slots the callee walks with va_arg.
+      fixedArgs <- forM (zip [0 ..] (take (length fixed) args)) $ \(i, a) -> do
         v <- genExpr a
-        case () of
-          _
-            | i < length fixed && not (isAgg (fixed !! i)) -> do
-                t <- mtlcOf (fixed !! i)
-                v' <- lift (cast fn v t)
-                pure (v', t)
-            | i < length fixed -> (,) v <$> i8pL
-            | variadic ->
-                -- the variadic tail, shaped as for a direct extern call:
-                -- floats pass their bits in a GP register
-                if typeIsFloat (exprTy a)
-                  then (\v' -> (v', i64)) <$> floatBitsAsI64 v
-                  else (\v' -> (v', i64)) <$> lift (cast fn v i64)
-            | otherwise -> (,) v <$> mtlcOf (exprTy a)
+        if not (isAgg (fixed !! i))
+          then do
+            t <- mtlcOf (fixed !! i)
+            v' <- lift (cast fn v t)
+            pure (v', t)
+          else (,) v <$> i8pL
+      argv <-
+        if variadic
+          then do
+            vbuf <- packVarArgs (drop (length fixed) args)
+            p <- i8pL
+            pure (fixedArgs ++ [(vbuf, p)])
+          else do
+            rest <- forM (drop (length fixed) args) $ \a -> do
+              v <- genExpr a
+              (,) v <$> mtlcOf (exprTy a)
+            pure (fixedArgs ++ rest)
       -- The callee's signature has to reach the backend, or it classifies
       -- every argument as integer and reads the result from RAX: any float
       -- in or out came back 0. A local declared with a real function-pointer
@@ -1464,6 +1474,32 @@ isArrayTy :: Type -> Bool
 isArrayTy TArray {} = True
 isArrayTy _ = False
 
+-- | Pack a variadic tail into a stack buffer of 8-byte slots: the one
+-- variadic convention. Floats store their promoted double BITS (va_arg
+-- reads them back with a float load); everything else widens to i64.
+packVarArgs :: [Expr] -> Lower Value
+packVarArgs extras = do
+  fn <- gets lsFn
+  u64 <- u64L
+  i64 <- i64L
+  f64 <- f64L
+  p <- i8pL
+  buf <- stackBytes (max 1 (length extras) * 8) Nothing
+  forM_ (zip [0 ..] extras) $ \(i, a) -> do
+    v <- genExpr a
+    off <- lift (constInt fn u64 (fromIntegral (i * 8 :: Int)))
+    addr <- lift (binary fn "+" buf off p)
+    if typeIsFloat (exprTy a)
+      then do
+        d <- lift (cast fn v f64)
+        pf <- lift (tyPointer f64)
+        fa <- lift (cast fn addr pf)
+        lift (store fn fa d f64)
+      else do
+        iv <- lift (cast fn v i64)
+        lift (store fn addr iv i64)
+  pure buf
+
 genDirectCall :: Expr -> Symbol -> [Expr] -> Lower Value
 genDirectCall e sym args = do
   fn <- gets lsFn
@@ -1476,43 +1512,17 @@ genDirectCall e sym args = do
   when (symIsExtern sym) $ ensureExternFn cname ft
   case () of
     _
-      | variadic && symIsExtern sym -> externVariadic fn cname fixed retT
       | variadic -> userVariadic fn cname fixed retT sret
       | sret -> sretCall fn cname retT
       | otherwise -> plainCall fn cname fixed
   where
     isArray TArray {} = True
     isArray _ = False
-    n = length args
-
-    -- Extern variadic: fixed args by prototype, tail as i64 padded to the
-    -- canonical arity so every call site matches one signature.
-    externVariadic fn cname fixed retT = do
-      i64 <- i64L
-      let total = max variadicPad n
-      argv <- forM (zip [0 ..] args) $ \(i, a) -> do
-        v <- genExpr a
-        if i < length fixed
-          then do
-            t <- mtlcOf (fixed !! i)
-            lift (cast fn v t)
-          else
-            if typeIsFloat (exprTy a)
-              then floatBitsAsI64 v
-              else lift (cast fn v i64)
-      pad <- forM [n .. total - 1] $ \_ -> lift (constInt fn i64 0)
-      rt <- retTy retT
-      lift (call fn cname (argv ++ pad) rt)
 
     -- User-defined variadic: trailing args are packed into a buffer the callee
     -- walks with __builtin_va_arg.
     userVariadic fn cname fixed retT sret = do
-      u64 <- u64L
-      i64 <- i64L
-      f64 <- f64L
-      p <- i8pL
       let nfixed = length fixed
-          extra = max 0 (n - nfixed)
       msret <-
         if sret
           then do
@@ -1524,22 +1534,7 @@ genDirectCall e sym args = do
       fixedArgs <- forM (zip fixed args) $ \(pt, a) -> do
         v <- genExpr a
         castTo v (exprTy a) pt
-      buf <- stackBytes (max 1 extra * 8) Nothing
-      forM_ (zip [0 ..] (drop nfixed args)) $ \(i, a) -> do
-        v <- genExpr a
-        off <- lift (constInt fn u64 (fromIntegral (i * 8 :: Int)))
-        addr <- lift (binary fn "+" buf off p)
-        if typeIsFloat (exprTy a)
-          then do
-            -- default argument promotion: store the double's BITS, not a
-            -- numeric conversion to integer
-            d <- lift (cast fn v f64)
-            pf <- lift (tyPointer f64)
-            fa <- lift (cast fn addr pf)
-            lift (store fn fa d f64)
-          else do
-            iv <- lift (cast fn v i64)
-            lift (store fn addr iv i64)
+      buf <- packVarArgs (drop nfixed args)
       rt <- if sret then i8pL else retTy retT
       r <- lift (call fn cname (maybe [] pure msret ++ fixedArgs ++ [buf]) rt)
       pure (fromMaybe r msret)
@@ -1805,6 +1800,12 @@ genVarDecl d = case dSym d of
       else do
         fn <- gets lsFn
         let ty = dType d
+            -- IR locals are name-scoped per function, and C block scoping
+            -- happily reuses a name: `case 'd': { long long v; }` next to
+            -- `case 'f': { double v; }` collided in the backend, and the
+            -- integer one read back through the float home as zero. The
+            -- symbol id makes every local's IR name unique.
+            irName = dName d ++ "." ++ show sid
         if isAgg ty
           then do
             bytes <- sizeOf ty
@@ -1820,12 +1821,12 @@ genVarDecl d = case dSym d of
                 nb <- lift (binary fn "*" cnt es u64)
                 heapBytes (Right nb)
               _ -> do
-                mem <- stackBytes (max 1 bytes) (Just (dName d))
+                mem <- stackBytes (max 1 bytes) (Just irName)
                 memZero mem (max 1 bytes)
                 pure mem
             -- a pointer local holding the object's base, for indexing and decay
             p <- i8pL
-            loc <- lift (local fn (dName d ++ "_p") p)
+            loc <- lift (local fn (irName ++ "_p") p)
             lift (assign fn loc mem)
             modify' $ \s ->
               s
@@ -1859,7 +1860,7 @@ genVarDecl d = case dSym d of
                 | otherwise -> genInitInto ty loc ini
           else do
             t <- mtlcOf ty
-            loc <- lift (local fn (dName d) t)
+            loc <- lift (local fn irName t)
             modify' $ \s -> s {lsLocals = M.insert sid loc (lsLocals s)}
             case dInit d of
               Nothing -> pure ()
