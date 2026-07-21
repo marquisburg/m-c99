@@ -16,6 +16,7 @@ module Mtlc
   , tyScalar
   , tyPointer
   , tyBlob
+  , tyFnPtr
     -- * Builder
   , builderCreate
   , builderDestroy
@@ -117,6 +118,14 @@ tyPointer = F.c_mtlc_type_pointer
 -- C aggregate contiguous stack storage via 'local'.
 tyBlob :: Int -> IO Ty
 tyBlob n = F.c_c99m_blob_type (fromIntegral n)
+
+-- | A function-pointer descriptor with a real signature. Declaring an indirect
+-- call's callee local with this type is what lets the backend put float
+-- arguments in XMM registers and read a float return from XMM0.
+tyFnPtr :: Ty -> [Ty] -> IO Ty
+tyFnPtr retT params =
+  withArrayLen params $ \n arr ->
+    F.c_c99m_fnptr_type retT arr (fromIntegral n)
 
 builderCreate :: IO Builder
 builderCreate = F.c_mtlc_builder_create

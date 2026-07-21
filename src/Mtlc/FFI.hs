@@ -65,6 +65,11 @@ foreign import ccall unsafe "mtlc_type_pointer"
 foreign import ccall unsafe "c99m_blob_type"
   c_c99m_blob_type :: CSize -> IO TypePtr
 
+-- | From cbits/blob.c: an interned function-pointer descriptor with a real
+-- signature, so an indirect call classifies float arguments and returns.
+foreign import ccall unsafe "c99m_fnptr_type"
+  c_c99m_fnptr_type :: TypePtr -> Ptr TypePtr -> CSize -> IO TypePtr
+
 -- ---- builder / module ----
 
 foreign import ccall unsafe "mtlc_builder_create"

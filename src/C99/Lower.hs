@@ -1404,28 +1404,56 @@ genCall e f args = do
             TPtr t@(TFunc {}) -> t
             t@(TFunc {}) -> t
             _ -> TFunc (exprTy e) [] False False
-          (fixed, retT) = case ft of
-            TFunc r ps _ _ -> (ps, r)
-            _ -> ([], exprTy e)
+          (fixed, variadic, retT) = case ft of
+            TFunc r ps var _ -> (ps, var, r)
+            _ -> ([], False, exprTy e)
           sret = isAgg retT && not (isArrayTy retT)
+      i64 <- i64L
+      -- Each argument value, paired with the IR type it is passed as. The
+      -- pairs feed the function-pointer descriptor below, so the signature
+      -- always matches this exact call.
       argv <- forM (zip [0 ..] args) $ \(i, a) -> do
         v <- genExpr a
-        if i < length fixed && not (isAgg (fixed !! i))
+        case () of
+          _
+            | i < length fixed && not (isAgg (fixed !! i)) -> do
+                t <- mtlcOf (fixed !! i)
+                v' <- lift (cast fn v t)
+                pure (v', t)
+            | i < length fixed -> (,) v <$> i8pL
+            | variadic ->
+                -- the variadic tail, shaped as for a direct extern call:
+                -- floats pass their bits in a GP register
+                if typeIsFloat (exprTy a)
+                  then (\v' -> (v', i64)) <$> floatBitsAsI64 v
+                  else (\v' -> (v', i64)) <$> lift (cast fn v i64)
+            | otherwise -> (,) v <$> mtlcOf (exprTy a)
+      -- The callee's signature has to reach the backend, or it classifies
+      -- every argument as integer and reads the result from RAX: any float
+      -- in or out came back 0. A local declared with a real function-pointer
+      -- type carries it.
+      (callee, rt) <-
+        if sret
           then do
-            t <- mtlcOf (fixed !! i)
-            lift (cast fn v t)
-          else pure v
+            p <- i8pL
+            pure (fp, p)
+          else (,) fp <$> retTy (exprTy e)
+      fpty <- lift . tyFnPtr rt =<< prependSret sret (map snd argv)
+      nm <- freshTmp "fptgt"
+      loc <- lift (local fn nm fpty)
+      lift (assign fn loc callee)
       if sret
         then do
           sz <- sizeOf retT
           buf <- stackBytes (max 1 sz) Nothing
           memZero buf (max 1 sz)
           p <- i8pL
-          _ <- lift (callIndirect fn fp (buf : argv) p)
+          _ <- lift (callIndirect fn loc (buf : map fst argv) p)
           pure buf
-        else do
-          rt <- retTy (exprTy e)
-          lift (callIndirect fn fp argv rt)
+        else lift (callIndirect fn loc (map fst argv) rt)
+  where
+    prependSret False tys = pure tys
+    prependSret True tys = (: tys) <$> i8pL
 
 retTy :: Type -> Lower Ty
 retTy TVoid = lift (tyScalar Void)

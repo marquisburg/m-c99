@@ -17,8 +17,8 @@ with gcc).
 
 ## Current state
 
-All twenty-five pass. Ten were failing when this directory was created, and
-each has a reproduction here so a regression cannot slip back in:
+All thirty-two pass. Each case here reproduces a bug that was live once, so a
+regression cannot slip back in:
 
 - `++`/`--` on a scalar global
 - signed bit-fields
@@ -30,9 +30,16 @@ each has a reproduction here so a regression cannot slip back in:
 - a variadic call destroying a `double`
 - a call with many arguments clobbering the caller's floating-point locals
 - the header/archive skew that made the backend crash on ordinary C
+- a scalar global with a floating initializer compiling to zero
+- struct/union tags leaking across block scopes
+- conversions into `float32` producing denormals
+- a float `==` corrupting every `float32` local in the function
+- indirect calls losing floating arguments and returns
+- an unsized array compound literal laid out as zero bytes
+- `float f; f += 0.5;` rounding twice
 
-The last three were backend faults, fixed in MettleToolchain and vendored back
-in through `vendor-libmtlc.sh`. See issues #13, #14 and #15.
+Several were backend faults, fixed in MettleToolchain and vendored back in
+through `vendor-libmtlc.sh`. See issues #13, #14 and #15.
 
 ## Adding a case
 
