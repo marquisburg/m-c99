@@ -506,7 +506,10 @@ checkExpr e = case exNode e of
   EInt _ suf -> pure (setTy (intLitType suf) e)
   EFloat _ isF -> pure (setTy (if isF then TFloat else TDouble) e)
   EChar _ -> pure (setTy TInt e) -- C promotes character literals to int
-  EString _ -> pure (setTy (TPtr TChar) e)
+  EString s ->
+    -- char[N], not char*: sizeof("ab") is 3. Use sites that want a pointer
+    -- get one from the usual decay.
+    pure (setTy (TArray TChar (length s + 1) False) e)
   EIdent name _ -> checkIdent e name
   EBinary op l r -> checkBinary e op l r
   EUnary op x -> checkUnary e op x
