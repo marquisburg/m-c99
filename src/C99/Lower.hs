@@ -512,6 +512,13 @@ applyGlobalInit d = do
         g <- lift (globalRef fn name)
         v <- genInit1 ini
         lift (assign fn g v)
+      (_, Just ini)
+        | typeIsFloat ty -> do
+            -- a scalar floating global: 'declareVar' left it zero
+            g <- lift (globalRef fn name)
+            v <- genInit1 ini
+            v' <- castTo v (initType ini) ty
+            lift (assign fn g v')
       _ -> pure ()
   where
     initType (IExpr e) = fromMaybe TInt (exTy e)
@@ -1951,6 +1958,14 @@ declareVar d
               (TPtr _, Just ini)
                 | not (isIntLit ini) -> do
                     -- a string, &obj, or a cast: needs code to materialize
+                    t <- mtlcOf ty
+                    lift (builderGlobal b name t 0 isExtern)
+                    modify' $ \s -> s {lsGlobalInits = lsGlobalInits s ++ [d]}
+              (_, Just _)
+                | typeIsFloat ty -> do
+                    -- 'builderGlobal' takes an integer constant, so a floating
+                    -- initializer cannot ride along with the declaration: it
+                    -- would be truncated to 0. Let the constructor assign it.
                     t <- mtlcOf ty
                     lift (builderGlobal b name t 0 isExtern)
                     modify' $ \s -> s {lsGlobalInits = lsGlobalInits s ++ [d]}
