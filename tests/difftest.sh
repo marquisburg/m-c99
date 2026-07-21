@@ -28,7 +28,9 @@ for src in "$@"; do
     printf '%-28s SKIP  gcc rejected it (the test itself is wrong)\n' "$name"
     skip=$((skip+1)); continue
   fi
-  gcc_out="$("$WORK/gcc.exe" 2>&1)"; gcc_rc=$?
+  "$WORK/gcc.exe" >"$WORK/gcc.out" 2>&1
+  gcc_rc=$?
+  gcc_out="$(tr -d '\r' <"$WORK/gcc.out")"
 
   fail=""
   for opt in -O0 -O1; do
@@ -37,7 +39,9 @@ for src in "$@"; do
       sed 's/^/      /' "$WORK/m.log" | grep -E 'error' | head -3
       fail="skip"; break
     fi
-    m_out="$("$WORK/m$opt.exe" 2>&1)"; m_rc=$?
+    "$WORK/m$opt.exe" >"$WORK/m.out" 2>&1
+    m_rc=$?
+    m_out="$(tr -d '\r' <"$WORK/m.out")"
 
     if [ "$m_out" != "$gcc_out" ] || [ "$m_rc" != "$gcc_rc" ]; then
       printf '%-28s DIFF  at %s\n' "$name" "$opt"
