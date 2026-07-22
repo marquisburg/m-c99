@@ -931,16 +931,32 @@ parsePointers base = do
       k <- curKind
       when (k == TkConst || k == TkVolatile || k == TkRestrict) (advance >> skipQuals)
 
--- | How many pointer layers sit on @t@ above @root@.
-ptrDepthAbove :: Type -> Type -> Int
-ptrDepthAbove = go (0 :: Int)
-  where
-    go d t root = case t of
-      TPtr b | t /= root && d <= 64 -> go (d + 1) b root
-      _ -> d
+-- | Where the parser is: the tokens left and the index. A parenthesized
+-- declarator has to be read after the suffixes that follow it, so the cursor
+-- goes back once; nothing is lexed twice and nothing is parsed twice.
+type Cursor = ([Token], Int)
 
-applyPtrs :: Int -> Type -> Type
-applyPtrs n t = iterate TPtr t !! max 0 n
+saveCursor :: P Cursor
+saveCursor = gets (\s -> (psToks s, psPos s))
+
+restoreCursor :: Cursor -> P ()
+restoreCursor (ts, n) = modify' $ \s -> s {psToks = ts, psPos = n}
+
+-- | Step over a balanced @(@ ... @)@, starting on the @(@.
+skipBalancedParens :: P ()
+skipBalancedParens = do
+  lp <- match TkLParen
+  when lp (go (1 :: Int))
+  where
+    go :: Int -> P ()
+    go 0 = pure ()
+    go d = do
+      k <- curKind
+      case k of
+        TkEof -> pure ()
+        TkLParen -> advance >> go (d + 1)
+        TkRParen -> advance >> go (d - 1)
+        _ -> advance >> go d
 
 -- | (type, declared name, parameters of a function suffix)
 type DeclResult = (Type, Maybe String, Maybe [Param])
@@ -950,44 +966,73 @@ parseDeclarator base = do
   (ty, nm, ps, _) <- parseDeclaratorVla base
   pure (ty, nm, ps)
 
+-- | One declarator, with whatever array bounds it collects left on the state
+-- for the caller. 'parseDeclaratorVla' brackets this to read them off; a
+-- declarator nested in parentheses calls it directly, so its bounds reach the
+-- same declaration rather than being dropped on the way back out.
+parseDeclaratorInner :: Type -> P DeclResult
+parseDeclaratorInner base = parsePointers base >>= parseDirectDeclarator
+
 -- | As 'parseDeclarator', but also reports the bounds of any array in the
 -- declarator that did not fold to a constant, outermost first.
 parseDeclaratorVla :: Type -> P (Type, Maybe String, Maybe [Param], [(Int, Expr)])
 parseDeclaratorVla base = do
   saved <- gets psVlaBounds
   modify' $ \s -> s {psVlaBounds = []}
-  (ty, nm, ps) <- parsePointers base >>= parseDirectDeclarator
+  (ty, nm, ps) <- parseDeclaratorInner base
   got <- gets psVlaBounds
   modify' $ \s -> s {psVlaBounds = saved}
   pure (ty, nm, ps, reverse got)
 
 parseDirectDeclarator :: Type -> P DeclResult
 parseDirectDeclarator base = do
+  open <- saveCursor
   lp <- match TkLParen
   if not lp
     then plain
     else do
       k <- curKind
       if k == TkStar || k == TkIdent || k == TkLParen
-        then do
-          -- Parenthesized declarator: the postfix suffixes outside the parens
-          -- apply to the base type first, and the pointer layers from the
-          -- nested declarator wrap the result. That is what makes
-          -- `int (*fp)(int)` a pointer to a function rather than a function
-          -- returning a pointer.
-          (inner, nm, ps1) <- parseDeclarator base
-          expect TkRParen
-          let stars = ptrDepthAbove inner base
-          (post, ps2) <- parsePostfixDeclarator base
-          pure (applyPtrs stars post, nm, ps2 <|> ps1)
+        then parenthesized open
         else do
-          expect TkRParen
+          -- Not a declarator inside the parens, so they are a parameter list on
+          -- a declarator with no name: `int (int x)` is a function taking int,
+          -- and `int ()` is one with an unspecified list. Put the paren back
+          -- and let the postfix reader take it.
+          restoreCursor open
           plain
   where
     plain = do
       nm <- optIdentName
       (ty, ps) <- parsePostfixDeclarator base
       pure (ty, nm, ps)
+
+    -- A declarator is read inside out. The suffixes that follow the closing
+    -- paren apply to the base type FIRST, and what they produce is the type
+    -- the parenthesized declarator declares: `(void)` turns int into
+    -- "function returning int", and only then does `*fp` make a pointer of it.
+    --
+    -- Those suffixes sit after the parens, so they have to be read before the
+    -- declarator they belong to. Skip the parens, read the suffixes, come back
+    -- for the declarator, then jump to the end. Every token is parsed once.
+    --
+    -- Carrying the whole type through instead of counting pointer layers is
+    -- what makes `int (*fp_arr[3])(void)` an array of three pointers to
+    -- function rather than a bare function type: the array is inside the
+    -- parens, and only the type survives the trip.
+    parenthesized open = do
+      restoreCursor open
+      skipBalancedParens
+      (post, ps2) <- parsePostfixDeclarator base
+      end <- saveCursor
+      restoreCursor open
+      _ <- match TkLParen
+      (inner, nm, ps1) <- parseDeclaratorInner post
+      expect TkRParen
+      restoreCursor end
+      -- The name's own parameters win: in `int (*f(int a))(int b)` it is f
+      -- that takes a, and the pointer it returns that takes b.
+      pure (inner, nm, ps1 <|> ps2)
 
 parsePostfixDeclarator :: Type -> P (Type, Maybe [Param])
 parsePostfixDeclarator base = do
@@ -1068,6 +1113,7 @@ parseParamList ret = do
 parseAbstractDeclarator :: Type -> P Type
 parseAbstractDeclarator base0 = do
   base <- parsePointers base0
+  open <- saveCursor
   lp <- match TkLParen
   if not lp
     then fst <$> parsePostfixDeclarator base
@@ -1079,11 +1125,19 @@ parseAbstractDeclarator base0 = do
           (ft, _) <- parseParamList base
           fst <$> parsePostfixDeclarator ft
         else do
-          inner <- parseAbstractDeclarator base
+          -- As in 'parseDirectDeclarator': the suffixes after the parens are
+          -- part of the type the parenthesized declarator declares, so read
+          -- them first. `int (*[3])(void)` is an array of function pointers.
+          restoreCursor open
+          skipBalancedParens
+          (post, _) <- parsePostfixDeclarator base
+          end <- saveCursor
+          restoreCursor open
+          _ <- match TkLParen
+          inner <- parseAbstractDeclarator post
           expect TkRParen
-          let stars = ptrDepthAbove inner base
-          (post, _) <- parsePostfixDeclarator (if stars == 0 then inner else base)
-          pure (applyPtrs stars post)
+          restoreCursor end
+          pure inner
 
 parseTypeName :: P Type
 parseTypeName = do

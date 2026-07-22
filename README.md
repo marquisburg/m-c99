@@ -96,9 +96,9 @@ Alongside the self-host loop:
 
 ```mermaid
 flowchart TD
-    CC["bin/c99mtlc.exe"] --> DIFF["<b>differential suite</b><br/>tests/diff, 46 cases<br/>gcc is the oracle, -O0 and -O1<br/>all pass"]
+    CC["bin/c99mtlc.exe"] --> DIFF["<b>differential suite</b><br/>tests/diff, 47 cases<br/>gcc is the oracle, -O0 and -O1<br/>all pass"]
     CC --> UNIT["<b>unit suite</b><br/>tests/run_suite.ps1<br/>codegen + diagnostics, all pass"]
-    CC --> CTS["<b>c-testsuite</b><br/>220 single-exec programs<br/>197 pass"]
+    CC --> CTS["<b>c-testsuite</b><br/>220 single-exec programs<br/>199 pass"]
     CC --> REAL["<b>real code</b><br/>cJSON and tinyexpr match gcc<br/>byte for byte at both levels"]
 ```
 
@@ -197,8 +197,12 @@ not. Each has a differential test.
   left one (C99 6.5.7p3), so an unsigned shift count cannot turn an
   arithmetic shift logical.
 - Cast precedence follows C99 6.5.4: `(T)a < b` is `((T)a) < b`.
-- `int a[3][4]` is array of arrays, `int (*fp)(int)` is a pointer to a
-  function, and `a[i][j]` on either strides correctly.
+- Declarators nest to any depth, read inside out the way C defines them.
+  `int (*fp_arr[3])(void)` is an array of three pointers to function,
+  `int (*f(int))(int)` is a function returning a function pointer,
+  `int (*(*pp)[3])(int, int)` is a pointer to an array of them, and
+  `int f(int g(int))` takes a function that adjusts to a pointer. `(*p)[i]`
+  indexes through a pointer to an array rather than through its contents.
 - `__thread` parses, warns honestly that storage is shared (libmtlc has no
   TLS), and `-Wno-thread-local` accepts that for single-threaded programs.
 - Any byte sequence in a source file survives being quoted in a diagnostic.
@@ -206,9 +210,6 @@ not. Each has a differential test.
 
 ## Known limits
 
-- An array of function pointers, `int (*fp_arr[3])(void)`, parses as a plain
-  function type. Plain function pointers, arrays of pointers, and pointers to
-  arrays are all fine.
 - A struct member whose array bound is a `sizeof` expression the parse-time
   folder cannot evaluate stays incomplete and lands at offset 0. The fix is
   to keep member bound expressions and fold them in sema.

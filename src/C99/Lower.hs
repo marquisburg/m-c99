@@ -1266,7 +1266,15 @@ genUnary e op x = case op of
     _ -> genLvalueAddr x
   Deref -> do
     p <- genExpr x
-    if isAgg (exprTy e)
+    -- `*p` where p points at an array or a struct yields the object's ADDRESS,
+    -- and that stays true after the array decays to a pointer: `(*p)[i]` and
+    -- `(void *)*p` both want p, not eight bytes read through it. Sema rewrites
+    -- the result type in place when it decays, so the answer has to come from
+    -- what is pointed at rather than from what this expression ended up typed.
+    let pointee = case typeDecay (exprTy x) of
+          TPtr b -> Just b
+          _ -> Nothing
+    if isAgg (exprTy e) || maybe False isAgg pointee
       then pure p
       else do
         fn <- gets lsFn
