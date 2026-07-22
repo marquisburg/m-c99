@@ -90,6 +90,7 @@ data TokenKind
   | TkRestrict
   | TkReturn
   | TkShort
+  | TkThreadLocal
   | TkSigned
   | TkSizeof
   | TkStatic
@@ -172,6 +173,8 @@ keywordTable =
     , ("restrict", TkRestrict)
     , ("return", TkReturn)
     , ("short", TkShort)
+    , ("__thread", TkThreadLocal)
+    , ("_Thread_local", TkThreadLocal)
     , ("signed", TkSigned)
     , ("sizeof", TkSizeof)
     , ("static", TkStatic)
@@ -266,6 +269,7 @@ tokenKindName k = case k of
   TkRestrict -> "restrict"
   TkReturn -> "return"
   TkShort -> "short"
+  TkThreadLocal -> "__thread"
   TkSigned -> "signed"
   TkSizeof -> "sizeof"
   TkStatic -> "static"

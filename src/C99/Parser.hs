@@ -21,7 +21,7 @@ import Data.Maybe (fromMaybe)
 
 import C99.Ast
 import C99.CType
-import C99.Common (Message (..), Severity (..), SrcLoc, diag, withCode, withLabel, withLen)
+import C99.Common (Message (..), Severity (..), SrcLoc, WarnGroup (..), diag, withCode, withLabel, withLen)
 import C99.Token
 
 -- ---- state ----
@@ -136,6 +136,16 @@ expect k = do
 
 perr :: SrcLoc -> String -> P ()
 perr loc text = modify' $ \s -> s {psMsgs = diag Error loc text : psMsgs s}
+
+pwarn :: WarnGroup -> SrcLoc -> String -> P ()
+pwarn g loc text =
+  modify' $ \s -> s {psMsgs = (diag Warning loc text) {msgGroup = Just g} : psMsgs s}
+
+-- | libmtlc has no thread-local storage, so @__thread@ gets an ordinary
+-- global. That is the same object for every thread, which is right for a
+-- single-threaded program and wrong for any other, so say so.
+threadLocalNote :: String
+threadLocalNote = "thread-local storage is not implemented; this object is shared by all threads"
 
 -- | An error that underlines a whole token and carries a code.
 perrTok :: Token -> String -> String -> Maybe String -> P ()
@@ -835,6 +845,11 @@ parseDeclSpecs = go (Specs BsNone Nothing False False 0 0 False ScNone False [])
         TkStatic -> advance >> go sp {spSc = ScStatic}
         TkAuto -> advance >> go sp
         TkRegister -> advance >> go sp
+        TkThreadLocal -> do
+          loc <- curLoc
+          advance
+          pwarn WThreadLocal loc threadLocalNote
+          go sp
         TkInline -> advance >> go sp
         TkConst -> advance >> go sp
         TkVolatile -> advance >> go sp
@@ -1323,7 +1338,18 @@ parseDeclOrStmt :: P BlockItem
 parseDeclOrStmt = do
   isT <- isTypeToken
   k <- curKind
-  if not (isT || k `elem` [TkTypedef, TkExtern, TkStatic, TkAuto, TkRegister, TkInline])
+  if not
+    ( isT
+        || k
+          `elem` [ TkTypedef
+                 , TkExtern
+                 , TkStatic
+                 , TkAuto
+                 , TkRegister
+                 , TkInline
+                 , TkThreadLocal
+                 ]
+    )
     then BIStmt <$> parseStmt
     else do
       loc <- curLoc
@@ -1375,7 +1401,7 @@ topDecl = do
   isT <- isTypeToken
   k <- curKind
   loc <- curLoc
-  if not (isT || k `elem` [TkTypedef, TkExtern, TkStatic, TkInline])
+  if not (isT || k `elem` [TkTypedef, TkExtern, TkStatic, TkInline, TkThreadLocal])
     then do
       t <- cur
       perrTok

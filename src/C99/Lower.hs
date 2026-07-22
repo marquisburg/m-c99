@@ -696,6 +696,11 @@ genLvalueAddr e = case exNode e of
     ty <- mtlcOf (exprTy e)
     pt <- lift (tyPointer ty)
     lift (cast fn sum' pt)
+  -- An expression of aggregate type evaluates to the address of its storage,
+  -- so `f().a` and `(c ? s : t).a` need no lvalue of their own: the temporary
+  -- the callee filled in is already addressable. C99 6.5.2.3 allows the member
+  -- access even though the struct itself is not an lvalue.
+  _ | isAgg (exprTy e) -> genExpr e
   _ -> do
     err (exLoc e) "not an lvalue"
     fn <- gets lsFn

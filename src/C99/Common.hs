@@ -57,6 +57,7 @@ data WarnGroup
   = WUnused
   | WUnreachable
   | WMissingReturn
+  | WThreadLocal
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 warnGroupName :: WarnGroup -> String
@@ -64,6 +65,7 @@ warnGroupName g = case g of
   WUnused -> "unused"
   WUnreachable -> "unreachable-code"
   WMissingReturn -> "missing-return"
+  WThreadLocal -> "thread-local"
 
 -- | One line each for @--help-warnings@.
 warnGroupBlurb :: WarnGroup -> String
@@ -71,6 +73,7 @@ warnGroupBlurb g = case g of
   WUnused -> "a block-scope variable nothing reads"
   WUnreachable -> "a statement control can never arrive at"
   WMissingReturn -> "a value-returning function that can run off its end"
+  WThreadLocal -> "a thread-local object, which this backend cannot give per-thread storage"
 
 allWarnGroups :: [WarnGroup]
 allWarnGroups = [minBound .. maxBound]
