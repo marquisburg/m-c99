@@ -15,7 +15,8 @@ import System.Directory (doesFileExist)
 import System.Environment (getArgs, getExecutablePath, lookupEnv)
 import System.Exit (exitFailure, exitSuccess)
 import System.FilePath (takeDirectory, (</>))
-import System.IO (hIsTerminalDevice, hPutStrLn, stderr)
+import GHC.IO.Encoding (mkTextEncoding)
+import System.IO (hIsTerminalDevice, hPutStrLn, hSetEncoding, stderr, stdout)
 
 import C99.Common
 import C99.CType (TypeContext, newTypeContext)
@@ -271,6 +272,14 @@ resolveColor Nothing = do
 
 main :: IO ()
 main = do
+  -- A C file may hold any bytes at all: a UTF-8 comment, a Latin-1 string, an
+  -- object file handed over by mistake. Whatever it holds can end up quoted in
+  -- a diagnostic, and the console's own encoding is rarely able to spell it.
+  -- Transliterate rather than die: a mangled character in a source quote beats
+  -- an encoding exception in place of the error the user asked about.
+  enc <- mkTextEncoding "UTF-8//TRANSLIT"
+  hSetEncoding stderr enc
+  hSetEncoding stdout enc
   args <- getArgs
   opts <- parseArgs args defaults
 
